@@ -14,6 +14,8 @@ import array
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
+FOX_CHESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines", "fox-chess")
+
 ADJUDICATOR_PATH = r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Stockfish 19\stockfish\stockfish-windows-x86-64-universal.exe"
 
 OPPONENTS = [
@@ -66,9 +68,8 @@ OPPONENTS = [
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Stockfish 18\stockfish\stockfish-windows-x86-64-avx2.exe",        3620),
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Stockfish 19\stockfish\stockfish-windows-x86-64-universal.exe",   3660),
     # --- Other engines ---
-    (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\FoxChess\fox-chess-v1.0-avx2-bmi2.exe",                            2740),
-    (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\FoxChess\fox-chess-v1.1-avx2-bmi2.exe",                            2870),
-    (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\FoxChess\fox-chess-v1.2-avx2-bmi2.exe",                            3060),
+    (os.path.join(FOX_CHESS_DIR, "v1.0-avx2-bmi2.exe"), 2740),
+    (os.path.join(FOX_CHESS_DIR, "v1.1-avx2-bmi2.exe"), 2870),
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\RandomMover\chess-random-mover.exe",                               300),
     # --- Maia v1 (lc0-based, human-like play; NPS forced to 1) ---
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Maia and Lc0\Maia v1\maia-1100.bat",                              1100),
