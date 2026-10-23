@@ -10,11 +10,75 @@ import sys
 import subprocess
 import random
 import array
+import platform
+import warnings
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------
 FOX_CHESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines", "fox-chess")
+
+def detect_fox_cpu():
+    """Return usable instruction flags and CPU identity; fail closed on detection errors."""
+    try:
+        from cpuinfo import get_cpu_info
+        info = get_cpu_info()
+        if platform.machine().lower() not in ("amd64", "x86_64"):
+            return {}
+        flags = set(info.get("flags", []))
+        if sys.platform == "win32":
+            # Windows checks include OS extended-register state support, not just CPUID.
+            import ctypes
+            supported = ctypes.windll.kernel32.IsProcessorFeaturePresent
+            supported.argtypes = [ctypes.c_uint]
+            supported.restype = ctypes.c_int
+            if not supported(40):  # PF_AVX2_INSTRUCTIONS_AVAILABLE
+                flags.discard("avx2")
+            if not supported(41):  # PF_AVX512F_INSTRUCTIONS_AVAILABLE
+                flags = {flag for flag in flags if not flag.startswith("avx512")}
+        elif sys.platform != "linux":
+            # Only Windows and Linux detection is supported for these x86 builds.
+            return {}
+        return dict(info, flags=flags)
+    except Exception as exc:
+        warnings.warn(f"Cannot detect FoxChess CPU support: {exc}. Install requirements.txt.")
+        return {}
+
+
+def fox_build_order(cpu):
+    """Prefer fast PEXT only on CPUs known to have hardware BMI2 (AMD Zen 3+)."""
+    flags = set(cpu.get("flags", []))
+    if "avx2" not in flags:
+        return []
+    vendor = cpu.get("vendor_id", "")
+    family = cpu.get("family", 0)
+    fast_bmi2 = "bmi2" in flags and (
+        vendor == "GenuineIntel" or
+        (vendor == "AuthenticAMD" and isinstance(family, int) and family >= 0x19)
+    )
+    order = ["avx2-bmi2", "avx2"] if fast_bmi2 else ["avx2"]
+    # Conservatively require the common AVX-512 subsets and fast BMI2: build
+    # filenames alone do not describe every instruction emitted by the compiler.
+    if fast_bmi2 and {"avx512f", "avx512bw", "avx512dq", "avx512vl"} <= flags:
+        order.insert(0, "avx512")
+    return order
+
+
+def fox_opponents(cpu=None, engine_dir=FOX_CHESS_DIR):
+    """Choose one existing, compatible executable per version, never duplicate ratings."""
+    order = fox_build_order(detect_fox_cpu() if cpu is None else cpu)
+    opponents = []
+    for prefix, rating in (("v1.0", 2740), ("v1.1", 2870),
+                           ("foxchess-current", 3060)):  # v1.2/current
+        for build in order:
+            path = os.path.join(engine_dir, f"{prefix}-{build}.exe")
+            if os.path.isfile(path):
+                opponents.append((path, rating))
+                break
+        else:
+            warnings.warn(f"Skipping FoxChess {prefix}: no compatible installed build.")
+    return opponents
+
 
 ADJUDICATOR_PATH = r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Stockfish 19\stockfish\stockfish-windows-x86-64-universal.exe"
 
@@ -68,8 +132,7 @@ OPPONENTS = [
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Stockfish 18\stockfish\stockfish-windows-x86-64-avx2.exe",        3620),
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Stockfish 19\stockfish\stockfish-windows-x86-64-universal.exe",   3660),
     # --- Other engines ---
-    (os.path.join(FOX_CHESS_DIR, "v1.0-avx2-bmi2.exe"), 2740),
-    (os.path.join(FOX_CHESS_DIR, "v1.1-avx2-bmi2.exe"), 2870),
+    *fox_opponents(),
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\RandomMover\chess-random-mover.exe",                               300),
     # --- Maia v1 (lc0-based, human-like play; NPS forced to 1) ---
     (r"C:\Users\Blake\Documents\_Projects\E\Eloify\engines\Maia and Lc0\Maia v1\maia-1100.bat",                              1100),
