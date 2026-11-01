@@ -731,6 +731,15 @@ def build_engine_config(engine, is_adjudicator=False, path=None, settings=None):
         h = settings.get("hash")
         if h is None:
             h = get_recommended_hash_mb(is_adjudicator)
+        # Cinnamon 1.x advertises up to 32768 MB, but its legacy allocator
+        # asserts when either of two large calloc() calls fails. The 32-bit
+        # 1.2c build cannot reliably allocate a ~2 GB table on Windows. Its
+        # signed-int size arithmetic also makes multi-GB requests unsafe.
+        # Keep this workaround engine-specific; modern engines retain the
+        # requested hash budget. Smaller user budgets are left unchanged.
+        name = (getattr(engine, "id", None) or {}).get("name", "")
+        if re.match(r"^Cinnamon\s+1(?:\.\d+[a-z]?)?(?=\s|$)", name, re.I):
+            h = min(h, 256)
         try:
             if opts["Hash"].max is not None:
                 h = min(h, opts["Hash"].max)
@@ -770,10 +779,14 @@ def apply_engine_config(engine, settings):
         return
     try:
         engine.configure(settings)
+    except (chess.engine.EngineTerminatedError, TimeoutError):
+        raise
     except Exception:
         for k, v in settings.items():
             try:
                 engine.configure({k: v})
+            except (chess.engine.EngineTerminatedError, TimeoutError):
+                raise
             except Exception:
                 pass
 
@@ -1276,9 +1289,24 @@ class TournamentWorker(threading.Thread):
 
     def _launch_engine(self, path, is_adjudicator=False):
         eng = chess.engine.SimpleEngine.popen(CompatibleUciProtocol, path)
-        cfg = build_engine_config(eng, is_adjudicator=is_adjudicator,
-                                  path=path, settings=self.settings)
-        apply_engine_config(eng, cfg)
+        cfg = {}
+        try:
+            cfg = build_engine_config(eng, is_adjudicator=is_adjudicator,
+                                      path=path, settings=self.settings)
+            apply_engine_config(eng, cfg)
+            # configure() only sends UCI commands. Wait for readyok so an
+            # allocation failure is reported here, not as ten failed moves.
+            eng.ping()
+        except Exception as exc:
+            details = _engine_failure_details(exc, eng)
+            self._kill_engine(eng)
+            raise chess.engine.EngineError(
+                f"Engine failed during configuration/readiness: {path}\n"
+                f"Applied options: {cfg!r}\n{details}") from exc
+        requested_hash = self.settings.get("hash")
+        if requested_hash is not None and cfg.get("Hash", requested_hash) < requested_hash:
+            self.queue.put(("status", f"{get_engine_name(eng)}: using Hash={cfg['Hash']} MB "
+                            f"instead of {requested_hash} MB (compatibility/option limits)"))
         return eng
 
     def _kill_engine(self, eng):
