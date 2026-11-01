@@ -23,3 +23,15 @@ Reports include the exception type/message, failed-attempt history, tracebacks,
 engine executable paths, settings, board position/moves, and a bounded tail of
 UCI traffic and engine stderr. Review reports for local paths before sharing;
 logs stay on your computer and are not uploaded automatically.
+
+## Legacy Cinnamon compatibility
+
+Cinnamon 1.x is limited to **256 MB of hash** (or your smaller requested budget).
+Its UCI-advertised 32768 MB maximum is not a safe allocation limit for the legacy
+32-bit builds: large requests can terminate the engine inside `Hash.cpp` before
+it searches. Eloify leaves other engines' hash budgets unchanged and shows the
+actual applied hash size in the engine configuration.
+
+Engine startup now waits for `readyok` after applying options. Configuration-time
+crashes are reported immediately with the applied options and recent engine
+output, rather than being retried as ten move failures.
