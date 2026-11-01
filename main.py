@@ -12,6 +12,7 @@ import random
 import array
 import platform
 import warnings
+import re
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
@@ -535,6 +536,56 @@ def is_maia_engine(engine, path=None):
 # ----------------------------------------------------------------------
 # UCI ENGINE CONFIGURATION
 # ----------------------------------------------------------------------
+# Old engines can hang in their own thread teardown after receiving quit.
+ENGINE_QUIT_TIMEOUT = 1.0
+LEGACY_MOVETIME_GRACE = 0.1
+
+
+class CompatibleUciProtocol(chess.engine.UciProtocol):
+    """Keep SF 2.2-era timer delays from overrunning fixed-time searches.
+
+    Still send the normal `go movetime`: the engine may finish early as usual.
+    Arm a fallback `stop` only once `go` is actually sent (not while configuring
+    hash/threads). Everything runs on python-chess's protocol event loop.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._movetime_stop = None
+
+    def _cancel_movetime_stop(self):
+        if self._movetime_stop is not None:
+            self._movetime_stop.cancel()
+            self._movetime_stop = None
+
+    def _stop_overdue_search(self):
+        self._movetime_stop = None
+        self.send_line("stop")
+
+    def send_line(self, line):
+        tokens = line.split()
+        if tokens and tokens[0] in ("go", "stop", "quit"):
+            self._cancel_movetime_stop()
+        super().send_line(line)
+        name = self.id.get("name", "")
+        if (tokens and tokens[0] == "go" and "movetime" in tokens
+                and "ponder" not in tokens and "infinite" not in tokens
+                and re.match(r"^Stockfish\s+2\.2(?:\.[12])?(?=\s|$)", name, re.I)):
+            milliseconds = int(tokens[tokens.index("movetime") + 1])
+            self._movetime_stop = self.loop.call_later(
+                milliseconds / 1000.0 + LEGACY_MOVETIME_GRACE,
+                self._stop_overdue_search)
+
+    def line_received(self, line):
+        if line.split()[:1] == ["bestmove"]:
+            self._cancel_movetime_stop()
+        super().line_received(line)
+
+    def connection_lost(self, exc):
+        self._cancel_movetime_stop()
+        super().connection_lost(exc)
+
+
 def build_engine_config(engine, is_adjudicator=False, path=None, settings=None):
     opts = engine.options
     s = {}
@@ -580,6 +631,10 @@ def build_engine_config(engine, is_adjudicator=False, path=None, settings=None):
         s["Ponder"] = False
     if "MultiPV" in opts:
         s["MultiPV"] = 1
+    # Legacy Stockfish otherwise busy-spins idle split-point workers. This is
+    # particularly costly with short searches and several engines alive.
+    if "Use Sleeping Threads" in opts:
+        s["Use Sleeping Threads"] = True
 
     if not is_adjudicator and path is not None and is_maia_engine(engine, path):
         s["NodesPerSecond"] = 1
@@ -1096,7 +1151,7 @@ class TournamentWorker(threading.Thread):
         self.opponent_reloaded = False
 
     def _launch_engine(self, path, is_adjudicator=False):
-        eng = chess.engine.SimpleEngine.popen_uci(path)
+        eng = chess.engine.SimpleEngine.popen(CompatibleUciProtocol, path)
         cfg = build_engine_config(eng, is_adjudicator=is_adjudicator,
                                   path=path, settings=self.settings)
         apply_engine_config(eng, cfg)
@@ -1105,14 +1160,22 @@ class TournamentWorker(threading.Thread):
     def _kill_engine(self, eng):
         if eng is None:
             return
+        old_timeout = eng.timeout
         try:
+            # SimpleEngine's normal 10s timeout is useful for startup/search,
+            # but not for an old engine stuck joining its threads on exit.
+            eng.timeout = ENGINE_QUIT_TIMEOUT
             eng.quit()
         except Exception:
             pass
-        try:
-            eng.close()
-        except Exception:
-            pass
+        finally:
+            eng.timeout = old_timeout
+            try:
+                # Kills the subprocess if graceful quit timed out; also closes
+                # python-chess's transport and background event loop.
+                eng.close()
+            except Exception:
+                pass
 
     def _reload_target(self):
         self.queue.put(("status", "Reloading target engine…"))
