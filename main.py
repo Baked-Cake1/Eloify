@@ -224,22 +224,44 @@ class TournamentAborted(Exception):
 # ----------------------------------------------------------------------
 # CLIPBOARD (cross-platform, no tkinter)
 # ----------------------------------------------------------------------
+def _windows_clipboard_api():
+    """Declare Win32 handle/pointer types explicitly (ctypes defaults to int)."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    signatures = (
+        (user32.OpenClipboard, [wintypes.HWND], wintypes.BOOL),
+        (user32.CloseClipboard, [], wintypes.BOOL),
+        (user32.EmptyClipboard, [], wintypes.BOOL),
+        (user32.GetClipboardData, [wintypes.UINT], wintypes.HANDLE),
+        (user32.SetClipboardData, [wintypes.UINT, wintypes.HANDLE], wintypes.HANDLE),
+        (kernel32.GlobalAlloc, [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL),
+        (kernel32.GlobalLock, [wintypes.HGLOBAL], ctypes.c_void_p),
+        (kernel32.GlobalUnlock, [wintypes.HGLOBAL], wintypes.BOOL),
+        (kernel32.GlobalFree, [wintypes.HGLOBAL], wintypes.HGLOBAL),
+    )
+    for function, args, result in signatures:
+        function.argtypes = args
+        function.restype = result
+    return user32, kernel32
+
+
 def _get_clipboard_text():
     if sys.platform == "win32":
         try:
             import ctypes
-            CF_UNICODETEXT = 13
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
+            user32, kernel32 = _windows_clipboard_api()
             if not user32.OpenClipboard(None):
                 raise RuntimeError("OpenClipboard failed")
             try:
-                handle = user32.GetClipboardData(CF_UNICODETEXT)
+                handle = user32.GetClipboardData(13)  # CF_UNICODETEXT
                 if not handle:
                     return ""
                 ptr = kernel32.GlobalLock(handle)
                 if not ptr:
-                    return ""
+                    raise RuntimeError("GlobalLock failed")
                 try:
                     return ctypes.wstring_at(ptr)
                 finally:
@@ -247,77 +269,92 @@ def _get_clipboard_text():
             finally:
                 user32.CloseClipboard()
         except Exception:
-            try:
-                result = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
-                    capture_output=True, text=True, timeout=2,
-                )
-                return result.stdout.rstrip("\r\n")
-            except Exception:
-                return ""
+            commands = [["powershell", "-NoProfile", "-Command",
+                         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+                         "Get-Clipboard -Raw"]]
     elif sys.platform == "darwin":
+        commands = [["pbpaste"]]
+    else:
+        commands = []
+        if os.environ.get("WAYLAND_DISPLAY"):
+            commands.append(["wl-paste", "--no-newline", "--type", "text"])
+        commands.extend([["xclip", "-selection", "clipboard", "-o"],
+                         ["xsel", "-b", "-o"]])
+    for command in commands:
         try:
             return subprocess.check_output(
-                ["pbpaste"], stderr=subprocess.DEVNULL
-            ).decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
-    else:
-        for cmd in (["xclip", "-selection", "clipboard", "-o"],
-                    ["xsel", "-b", "-o"]):
-            try:
-                return subprocess.check_output(
-                    cmd, stderr=subprocess.DEVNULL
-                ).decode("utf-8", errors="ignore")
-            except Exception:
-                continue
+                command, stderr=subprocess.DEVNULL, timeout=2
+            ).decode("utf-8-sig")
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            continue
+    # SDL's clipboard works on X11 even without external clipboard utilities.
+    try:
+        if not pygame.scrap.get_init():
+            pygame.scrap.init()
+        pygame.scrap.set_mode(pygame.SCRAP_CLIPBOARD)
+        data = pygame.scrap.get(pygame.SCRAP_TEXT)
+        return data.rstrip(b"\x00").decode("utf-8") if data else ""
+    except Exception:
         return ""
+
 
 def _set_clipboard_text(text):
     if sys.platform == "win32":
         try:
             import ctypes
-            CF_UNICODETEXT = 13
-            GMEM_MOVEABLE = 0x0002
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
+            user32, kernel32 = _windows_clipboard_api()
             data = text.encode("utf-16-le") + b"\x00\x00"
-            if not user32.OpenClipboard(None):
+            # A real owner window is required: EmptyClipboard after opening with
+            # NULL makes SetClipboardData fail according to the Win32 contract.
+            owner = pygame.display.get_wm_info().get("window")
+            if not owner or not user32.OpenClipboard(owner):
                 return False
+            handle = None
             try:
-                user32.EmptyClipboard()
-                h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-                if not h:
+                handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+                if not handle:
                     return False
-                ptr = kernel32.GlobalLock(h)
+                ptr = kernel32.GlobalLock(handle)
                 if not ptr:
                     return False
                 try:
                     ctypes.memmove(ptr, data, len(data))
                 finally:
-                    kernel32.GlobalUnlock(h)
-                user32.SetClipboardData(CF_UNICODETEXT, h)
+                    kernel32.GlobalUnlock(handle)
+                if not user32.EmptyClipboard():
+                    return False
+                if not user32.SetClipboardData(13, handle):
+                    return False
+                handle = None  # Windows now owns the allocation; do not free it.
                 return True
             finally:
+                if handle:
+                    kernel32.GlobalFree(handle)
                 user32.CloseClipboard()
         except Exception:
             return False
     elif sys.platform == "darwin":
-        try:
-            proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-            proc.communicate(text.encode("utf-8"))
-            return True
-        except Exception:
-            return False
+        commands = [["pbcopy"]]
     else:
-        for cmd in (["xclip", "-selection", "clipboard"],
-                    ["xsel", "-b", "-i"]):
-            try:
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-                proc.communicate(text.encode("utf-8"))
-                return True
-            except Exception:
-                continue
+        commands = []
+        if os.environ.get("WAYLAND_DISPLAY"):
+            commands.append(["wl-copy", "--type", "text/plain;charset=utf-8"])
+        commands.extend([["xclip", "-selection", "clipboard"],
+                         ["xsel", "-b", "-i"]])
+    for command in commands:
+        try:
+            subprocess.run(command, input=text.encode("utf-8"),
+                           stderr=subprocess.DEVNULL, check=True, timeout=2)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    try:
+        if not pygame.scrap.get_init():
+            pygame.scrap.init()
+        pygame.scrap.set_mode(pygame.SCRAP_CLIPBOARD)
+        pygame.scrap.put(pygame.SCRAP_TEXT, text.encode("utf-8") + b"\x00")
+        return True
+    except Exception:
         return False
 
 # ----------------------------------------------------------------------
@@ -1868,6 +1905,7 @@ class EloifyApp:
 
         self.browse_cwd = start_dir
         self.browse_path_field.set_text(start_dir)
+        self.browse_path_field.select_all()
         self.browse_selected = -1
         self.browse_scroll = 0
         self.browse_error = ""
@@ -2066,7 +2104,8 @@ class EloifyApp:
     def _handle_browse_key_down(self, event):
         key = event.key
         mods = event.mod
-        ctrl = bool(mods & pygame.KMOD_CTRL)
+        ctrl = bool(mods & pygame.KMOD_CTRL) or (
+            sys.platform == "darwin" and bool(mods & pygame.KMOD_GUI))
         shift = bool(mods & pygame.KMOD_SHIFT)
         alt = bool(mods & pygame.KMOD_ALT)
         first = key not in self._keys_down
@@ -2081,13 +2120,17 @@ class EloifyApp:
             if key == pygame.K_c:
                 if field.has_selection():
                     a, b = field.get_selection_range()
-                    _set_clipboard_text(field.text[a:b])
+                    if not _set_clipboard_text(field.text[a:b]):
+                        self.browse_error = "Could not copy to the clipboard."
                 return
             if key == pygame.K_x:
                 if field.has_selection():
                     a, b = field.get_selection_range()
-                    _set_clipboard_text(field.text[a:b])
-                    field.delete_selection()
+                    if _set_clipboard_text(field.text[a:b]):
+                        field.delete_selection()
+                        self.browse_selected = -1
+                    else:
+                        self.browse_error = "Could not copy to the clipboard; text was not cut."
                 return
             if key == pygame.K_v:
                 text = _get_clipboard_text()
@@ -2098,6 +2141,9 @@ class EloifyApp:
                     text = text[1:-1].strip()
                 if text:
                     field.insert(text)
+                    self.browse_selected = -1
+                    self.browse_focus = "text"
+                    self.browse_error = ""
                 return
 
         if first:
@@ -2349,7 +2395,9 @@ class EloifyApp:
         draw_text(self.screen, "Browse for UCI Engine",
                   (panel.x + 30, panel.y + 20), 26, ACCENT, bold=True)
         draw_text(self.screen,
-                  "Navigate folders or paste a path · Ctrl+V to paste · Ctrl+A to select all",
+                  ("Navigate folders or paste a path · Cmd+V to paste · Cmd+A to select all"
+                   if sys.platform == "darwin" else
+                   "Navigate folders or paste a path · Ctrl+V to paste · Ctrl+A to select all"),
                   (panel.x + 30, panel.y + 54), 14, DIM_TEXT)
         pygame.draw.line(self.screen, BORDER,
                          (panel.x + 30, panel.y + 82),
@@ -2409,6 +2457,8 @@ class EloifyApp:
                     self.handle_key_down(event)
                 elif event.type == pygame.KEYUP:
                     self.handle_key_up(event)
+                elif event.type == pygame.WINDOWFOCUSLOST:
+                    self.handle_focus_lost()
             self.process_queue()
             self.draw()
             self.clock.tick(FPS)
@@ -2420,6 +2470,12 @@ class EloifyApp:
     def handle_key_up(self, event):
         if self.state == "BROWSE_ENGINE":
             self._keys_down.discard(event.key)
+
+    def handle_focus_lost(self):
+        # KEYUP may go to another application after Alt+Tab / Command+Tab.
+        # Do not let a stale V/C/etc. suppress the next clipboard shortcut.
+        self._keys_down.clear()
+        self.browse_drag_active = False
 
     def handle_mouse_wheel(self, event):
         if self.state == "BROWSE_ENGINE":
