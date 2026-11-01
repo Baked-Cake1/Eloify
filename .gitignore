@@ -1,0 +1,4 @@
+# Runtime diagnostic reports and Python bytecode
+/logs/
+__pycache__/
+*.py[cod]

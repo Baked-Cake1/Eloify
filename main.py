@@ -13,6 +13,10 @@ import array
 import platform
 import warnings
 import re
+import tempfile
+import traceback
+from collections import deque
+from datetime import datetime
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
@@ -212,6 +216,12 @@ LIST_BG        = (26, 30, 38)
 LIST_ROW_HOVER = (40, 46, 56)
 LIST_ROW_SEL   = (50, 90, 70)
 
+# Error report layout and default on-disk destination.
+ERROR_REPORT_RECT = pygame.Rect(40, 150, WINDOW_WIDTH - 80, WINDOW_HEIGHT - 240)
+ERROR_COPY_RECT = pygame.Rect(40, WINDOW_HEIGHT - 65, 200, 38)
+ERROR_BACK_RECT = pygame.Rect(WINDOW_WIDTH - 240, WINDOW_HEIGHT - 65, 200, 38)
+ERROR_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
 # ----------------------------------------------------------------------
 # EXCEPTIONS
 # ----------------------------------------------------------------------
@@ -356,6 +366,76 @@ def _set_clipboard_text(text):
         return True
     except Exception:
         return False
+
+# ----------------------------------------------------------------------
+# ENGINE ERROR DIAGNOSTICS
+# ----------------------------------------------------------------------
+def _exception_message(exc):
+    message = str(exc).strip()
+    if not message:
+        message = ("Engine did not respond before the command timeout."
+                   if isinstance(exc, TimeoutError) else "No error message supplied.")
+    return f"{type(exc).__name__}: {message}"
+
+
+def _engine_failure_details(exc, engine):
+    details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    protocol = getattr(engine, "protocol", None)
+    recent = getattr(protocol, "diagnostics", ())
+    # Copy on the protocol's deque before formatting, since its event loop may
+    # still be receiving output while the worker handles the failure.
+    recent = recent.copy() if isinstance(recent, deque) else recent
+    if recent:
+        details += "\nRecent UCI traffic / engine stderr:\n" + "\n".join(recent) + "\n"
+    return details
+
+
+def _save_error_log(report):
+    """Save a unique UTF-8 report, falling back if the install is read-only."""
+    directories = (ERROR_LOG_DIR, os.path.expanduser("~/.eloify/logs"),
+                   os.path.join(tempfile.gettempdir(), "Eloify", "logs"))
+    failures = []
+    for directory in dict.fromkeys(directories):
+        path = None
+        try:
+            os.makedirs(directory, exist_ok=True)
+            fd, path = tempfile.mkstemp(
+                prefix=datetime.now().strftime("eloify-error-%Y%m%d-%H%M%S-"),
+                suffix=".log", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace") as log:
+                log.write(report)
+            return os.path.abspath(path), None
+        except OSError as exc:
+            failures.append(f"{directory}: {_exception_message(exc)}")
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    return None, "\n".join(failures)
+
+
+def _wrap_error_text(text, font, width):
+    """Pixel-wrap report lines, including long unbroken executable paths."""
+    lines = []
+    for raw_line in text.splitlines():
+        remaining = raw_line.expandtabs(4)
+        while remaining and font.size(remaining)[0] > width:
+            lo, hi = 1, len(remaining)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if font.size(remaining[:mid])[0] <= width:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            cut = remaining.rfind(" ", 0, lo + 1)
+            if cut <= 0:
+                cut = lo
+            lines.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip()
+        lines.append(remaining)
+    return lines
+
 
 # ----------------------------------------------------------------------
 # TEXT FIELD (editable single-line input with cursor/selection)
@@ -589,6 +669,7 @@ class CompatibleUciProtocol(chess.engine.UciProtocol):
     def __init__(self):
         super().__init__()
         self._movetime_stop = None
+        self.diagnostics = deque(maxlen=80)
 
     def _cancel_movetime_stop(self):
         if self._movetime_stop is not None:
@@ -600,6 +681,7 @@ class CompatibleUciProtocol(chess.engine.UciProtocol):
         self.send_line("stop")
 
     def send_line(self, line):
+        self.diagnostics.append(">> " + line[:2000])
         tokens = line.split()
         if tokens and tokens[0] in ("go", "stop", "quit"):
             self._cancel_movetime_stop()
@@ -614,9 +696,14 @@ class CompatibleUciProtocol(chess.engine.UciProtocol):
                 self._stop_overdue_search)
 
     def line_received(self, line):
+        self.diagnostics.append("<< " + line[:2000])
         if line.split()[:1] == ["bestmove"]:
             self._cancel_movetime_stop()
         super().line_received(line)
+
+    def error_line_received(self, line):
+        self.diagnostics.append("stderr: " + line[:2000])
+        super().error_line_received(line)
 
     def connection_lost(self, exc):
         self._cancel_movetime_stop()
@@ -1250,8 +1337,43 @@ class TournamentWorker(threading.Thread):
         self.adjudicator_engine = self._launch_engine(ADJUDICATOR_PATH,
                                                        is_adjudicator=True)
 
+    def _report_error(self, summary, exc, role="target", failures=None, board=None):
+        board = self.board if board is None else board
+        engine = {"target": self.target_engine, "opponent": self.opponent_engine,
+                  "adjudicator": self.adjudicator_engine}.get(role)
+        fallback = {"target": self.target_name, "opponent": self.opponent_name,
+                    "adjudicator": "Adjudicator"}.get(role, role.capitalize())
+        name = get_engine_name(engine, fallback)
+        report = "\n".join([
+            "Eloify engine error report",
+            summary,
+            "Last error: " + _exception_message(exc),
+            "",
+            "Time: " + datetime.now().astimezone().isoformat(),
+            f"Engine role: {role}",
+            f"Engine name: {name}",
+            f"Target executable: {self.target_path}",
+            f"Opponent executable: {self.current_opponent_path}",
+            f"Adjudicator executable: {ADJUDICATOR_PATH}",
+            f"Settings: {self.settings!r}",
+            f"Completed games: {self.games_played}",
+            f"Position (FEN): {board.fen()}",
+            "Moves (UCI): " + " ".join(move.uci() for move in board.move_stack),
+            "",
+            "Failure history / tracebacks:",
+            "\n".join(failures) if failures else _engine_failure_details(exc, engine),
+        ])
+        log_path, log_error = _save_error_log(report)
+        if log_path:
+            report = f"Log file: {log_path}\n\n" + report
+        else:
+            report = "Log file could not be saved:\n" + log_error + "\n\n" + report
+        self.queue.put(("error", {"summary": summary, "report": report,
+                                  "log_path": log_path, "log_error": log_error}))
+
     def _safe_play(self, board, role):
         consecutive_target_fails = 0
+        failures = []
         time_limit = self.settings.get("time", TIME_LIMIT)
         while True:
             if not self.running:
@@ -1265,7 +1387,9 @@ class TournamentWorker(threading.Thread):
                     raise ValueError(f"Engine returned illegal move: {result.move}")
                 return result
             except Exception as e:
-                self.queue.put(("status", f"{role.capitalize()} engine error: {e}"))
+                failures.append(f"Attempt {len(failures) + 1}: {_exception_message(e)}\n"
+                                + _engine_failure_details(e, engine))
+                self.queue.put(("status", f"{role.capitalize()} engine error: {_exception_message(e)}"))
                 if role == "opponent":
                     if self.opponent_reloaded:
                         raise OpponentDead()
@@ -1278,16 +1402,20 @@ class TournamentWorker(threading.Thread):
                         raise OpponentDead()
                 else:
                     consecutive_target_fails += 1
-                    if consecutive_target_fails > MAX_MOVE_RETRIES:
-                        self.queue.put((
-                            "error",
-                            f"Target failed {MAX_MOVE_RETRIES} times consecutively — forfeiting game"))
-                        raise TournamentAborted()
+                    if consecutive_target_fails >= MAX_MOVE_RETRIES:
+                        self._report_error(
+                            f"Target failed {consecutive_target_fails} times consecutively — forfeiting game",
+                            e, role, failures, board)
+                        self.running = False
+                        raise TournamentAborted() from e
                     try:
                         self._reload_target()
                         self.queue.put(("status", "Target reloaded — retrying"))
                     except Exception as reload_err:
-                        self.queue.put(("error", f"Could not reload target: {reload_err}"))
+                        failures.append("Target reload failed:\n"
+                                        + _engine_failure_details(reload_err, self.target_engine))
+                        self._report_error("Could not reload target", reload_err,
+                                           role, failures, board)
                         self.running = False
                         raise TournamentAborted()
 
@@ -1315,7 +1443,7 @@ class TournamentWorker(threading.Thread):
             try:
                 self.target_engine = self._launch_engine(self.target_path, is_adjudicator=False)
             except Exception as e:
-                self.queue.put(("error", f"Could not launch target engine: {e}"))
+                self._report_error("Could not launch target engine", e)
                 return
             self.target_name = get_engine_name(self.target_engine,
                                                os.path.basename(self.target_path))
@@ -1332,7 +1460,7 @@ class TournamentWorker(threading.Thread):
                 self.adjudicator_engine = self._launch_engine(ADJUDICATOR_PATH,
                                                               is_adjudicator=True)
             except Exception as e:
-                self.queue.put(("error", f"Could not launch adjudicator: {e}"))
+                self._report_error("Could not launch adjudicator", e, role="adjudicator")
                 self._kill_engine(self.target_engine)
                 return
 
@@ -1406,7 +1534,7 @@ class TournamentWorker(threading.Thread):
             self.queue.put(("done", (estimate, ci)))
 
         except Exception as e:
-            self.queue.put(("error", str(e)))
+            self._report_error("Unexpected tournament error", e)
             self._kill_engine(self.target_engine)
             self._kill_engine(self.opponent_engine)
             self._kill_engine(self.adjudicator_engine)
@@ -1550,6 +1678,10 @@ class EloifyApp:
         self.estimate_kind = None
         self.confidence = None
         self.error_text = None
+        self.error_report = ""
+        self.error_clipboard_status = ""
+        self.error_scroll = 0
+        self._error_lines = None
         self.start_time = None
 
         self.animation = None
@@ -2466,6 +2598,13 @@ class EloifyApp:
     def handle_key_down(self, event):
         if self.state == "BROWSE_ENGINE":
             self._handle_browse_key_down(event)
+        elif self.state == "DONE" and self.error_text:
+            command = bool(event.mod & pygame.KMOD_CTRL) or (
+                sys.platform == "darwin" and bool(event.mod & pygame.KMOD_GUI))
+            if command and event.key == pygame.K_c:
+                self._copy_error_report()
+            elif event.key == pygame.K_ESCAPE:
+                self.reset()
 
     def handle_key_up(self, event):
         if self.state == "BROWSE_ENGINE":
@@ -2478,7 +2617,9 @@ class EloifyApp:
         self.browse_drag_active = False
 
     def handle_mouse_wheel(self, event):
-        if self.state == "BROWSE_ENGINE":
+        if self.state == "DONE" and self.error_text:
+            self.error_scroll = max(0, self.error_scroll - event.y * 3)
+        elif self.state == "BROWSE_ENGINE":
             if BROWSE_LIST.collidepoint(self.mouse_pos):
                 self.browse_scroll -= event.y
                 visible = BROWSE_LIST.h // BROWSE_ROW_HEIGHT
@@ -2498,6 +2639,12 @@ class EloifyApp:
         elif self.state == "BROWSE_ENGINE":
             self._handle_browse_click(pos)
         elif self.state == "DONE":
+            if self.error_text:
+                if ERROR_COPY_RECT.collidepoint(pos):
+                    self._copy_error_report()
+                elif ERROR_BACK_RECT.collidepoint(pos):
+                    self.reset()
+                return
             if self.done_start_time is not None:
                 elapsed = time.time() - self.done_start_time
                 if elapsed < REVEAL_DURATION + ELO_POP_DURATION:
@@ -2528,6 +2675,10 @@ class EloifyApp:
     def start_tournament(self):
         self.state = "RUNNING"
         self.error_text = None
+        self.error_report = ""
+        self.error_clipboard_status = ""
+        self.error_scroll = 0
+        self._error_lines = None
         self.status_text = "Starting tournament…"
         self.start_time = time.time()
         self.progress_queue = queue.Queue()
@@ -2559,6 +2710,8 @@ class EloifyApp:
                 if msg[0] == "status":
                     self.status_text = msg[1]
                 elif msg[0] == "done":
+                    if self.error_text:
+                        continue  # Cleanup must not replace a fatal diagnostic.
                     self.state = "DONE"
                     self.done_start_time = time.time()
                     self.confetti = []
@@ -2579,7 +2732,12 @@ class EloifyApp:
                 elif msg[0] == "error":
                     self.state = "DONE"
                     self.estimated_elo = None
-                    self.error_text = msg[1]
+                    error = msg[1]
+                    self.error_text = error["summary"]
+                    self.error_report = error["report"]
+                    self.error_scroll = 0
+                    self._error_lines = None
+                    self._copy_error_report()
                     self.done_start_time = time.time()
         except queue.Empty:
             pass
@@ -3097,16 +3255,44 @@ class EloifyApp:
                   (x, y + 392), 16, TEXT_COLOR)
         draw_text(self.screen, self.status_text, (30, 700), 14, DIM_TEXT)
 
+    def _copy_error_report(self):
+        try:
+            copied = _set_clipboard_text(self.error_report)
+        except Exception:
+            copied = False
+        self.error_clipboard_status = (
+            "Full error report copied to clipboard."
+            if copied else "Clipboard unavailable. Use Copy report to retry; see the log path below.")
+
+    def _draw_error_report(self):
+        draw_text_centered(self.screen, "Engine Error",
+                           (WINDOW_WIDTH // 2, 40), 30, ERROR_COLOR, bold=True)
+        draw_text(self.screen, self.error_clipboard_status, (40, 85), 16, TEXT_COLOR)
+        draw_text(self.screen, "Scroll to read details. Copy report includes the full failure history.",
+                  (40, 113), 14, DIM_TEXT)
+        rect = ERROR_REPORT_RECT
+        pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
+        font = _get_font(_FONT_FAMILY, 14)
+        if self._error_lines is None:
+            self._error_lines = _wrap_error_text(self.error_report, font, rect.w - 24)
+        line_height = max(20, font.get_linesize())
+        visible = max(1, (rect.h - 20) // line_height)
+        self.error_scroll = min(self.error_scroll, max(0, len(self._error_lines) - visible))
+        for row, line in enumerate(self._error_lines[self.error_scroll:self.error_scroll + visible]):
+            draw_text(self.screen, line, (rect.x + 12, rect.y + 10 + row * line_height),
+                      14, TEXT_COLOR)
+        self._draw_browse_button(ERROR_COPY_RECT, "Copy report", primary=True)
+        self._draw_browse_button(ERROR_BACK_RECT, "Back to menu")
+
     def draw_done(self):
-        if self.estimated_elo is None or self.error_text:
+        if self.error_text:
+            self._draw_error_report()
+            return
+        if self.estimated_elo is None:
             draw_text_centered(self.screen, "Test Complete",
                                (WINDOW_WIDTH // 2, 40), 30, ACCENT, bold=True)
-            if self.error_text:
-                draw_text_centered(self.screen, f"Error: {self.error_text}",
-                                   (WINDOW_WIDTH // 2, 100), 20, ERROR_COLOR)
-            else:
-                draw_text_centered(self.screen, "Could not estimate Elo",
-                                   (WINDOW_WIDTH // 2, 100), 26, ERROR_COLOR)
+            draw_text_centered(self.screen, "Could not estimate Elo",
+                               (WINDOW_WIDTH // 2, 100), 26, ERROR_COLOR)
             draw_text_centered(self.screen, "Click anywhere to run another test.",
                                (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 40), 16, DIM_TEXT)
             return
@@ -3191,6 +3377,10 @@ class EloifyApp:
         self.estimate_kind = None
         self.confidence = None
         self.error_text = None
+        self.error_report = ""
+        self.error_clipboard_status = ""
+        self.error_scroll = 0
+        self._error_lines = None
         self.worker = None
         self.animation = None
         self.last_animated_fen = chess.STARTING_FEN

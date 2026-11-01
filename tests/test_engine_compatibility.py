@@ -1,5 +1,6 @@
 """Exercise engine compatibility without importing or initializing the pygame GUI."""
 import ast
+from collections import deque
 from pathlib import Path
 import re
 import sys
@@ -15,7 +16,7 @@ import chess.engine
 
 ROOT = Path(__file__).resolve().parents[1]
 tree = ast.parse((ROOT / "main.py").read_text())
-ns = dict(chess=chess, re=re)
+ns = dict(chess=chess, re=re, deque=deque)
 names = {"CompatibleUciProtocol", "build_engine_config"}
 constants = {"ENGINE_QUIT_TIMEOUT", "LEGACY_MOVETIME_GRACE"}
 nodes = [n for n in tree.body
