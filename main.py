@@ -156,6 +156,40 @@ TIME_LIMIT = 0.1
 
 MAX_MOVE_RETRIES = 10
 
+# Automatic >3600 Elo time-odds extension for top engines.
+# Multiplies the strongest available engine's per-move budget to create fixed
+# high-Elo tiers (e.g. 3740–4010 Elo when anchored on Stockfish 19 at 3660).
+HIGH_ELO_TIME_ODDS_TIERS = (
+    (2,  80),
+    (4,  155),
+    (8,  225),
+    (16, 290),
+    (32, 350),
+)
+HIGH_ELO_TRIGGER_RATING = 3550
+HIGH_ELO_TOP_BRACKET = 3500
+HIGH_ELO_MIN_TOP_SCORE = 0.50
+HIGH_ELO_DEFAULT_ANCHOR_RATING = 3660
+
+# Balanced paired openings used only in the >3600 extension (each played with
+# both colors per tier so top engines do not repeat identical startpos draws).
+HIGH_ELO_OPENINGS = (
+    ("Sicilian Najdorf",       ("e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "a7a6")),
+    ("Ruy Lopez Open",         ("e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6", "e1g1", "f6e4")),
+    ("French Winawer",         ("e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "f8b4", "e4e5", "c7c5", "a2a3", "b4c3", "b2c3", "g8e7")),
+    ("Caro-Kann Advance",      ("e2e4", "c7c6", "d2d4", "d7d5", "e4e5", "c8f5", "g1f3", "e7e6", "f1e2", "c6c5")),
+    ("Nimzo-Indian",           ("d2d4", "g8f6", "c2c4", "e7e6", "b1c3", "f8b4", "e2e3", "e8g8", "f1d3", "d7d5")),
+    ("King's Indian",          ("d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "f8g7", "e2e4", "d7d6", "g1f3", "e8g8")),
+    ("Gruenfeld Exchange",     ("d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "d7d5", "c4d5", "f6d5", "e2e4", "d5c3", "b2c3", "f8g7")),
+    ("Semi-Slav Meran",        ("d2d4", "d7d5", "c2c4", "c7c6", "g1f3", "g8f6", "b1c3", "e7e6", "e2e3", "b8d7")),
+    ("Queen's Gambit Ragozin", ("d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6", "g1f3", "f8b4", "c1g5", "h7h6")),
+    ("Catalan Open",           ("d2d4", "g8f6", "c2c4", "e7e6", "g2g3", "d7d5", "f1g2", "d5c4", "g1f3", "f8e7")),
+    ("English Four Knights",   ("c2c4", "e7e5", "b1c3", "g8f6", "g1f3", "b8c6", "g2g3", "d7d5", "c4d5", "f6d5")),
+    ("Sicilian Scheveningen",  ("e2e4", "c7c5", "g1f3", "e7e6", "d2d4", "c5d4", "f3d4", "g8f6", "b1c3", "d7d6")),
+)
+
+RESULTS_VISIBLE_ROWS = 13
+
 # ----------------------------------------------------------------------
 # UI CONSTANTS  — refined palette
 # ----------------------------------------------------------------------
@@ -544,16 +578,21 @@ def estimate_elo_vs_pool(per_opponent):
         s = 0.0
         for opp_rating, w, d, l in per_opponent:
             n = w + d + l
-            p = 1.0 / (1.0 + 10.0 ** ((opp_rating - target_elo) / 400.0))
+            exp = max(-100.0, min(100.0, (opp_rating - target_elo) / 400.0))
+            p = 1.0 / (1.0 + 10.0 ** exp)
             s += p * n
         return s
 
-    if total_score >= total_games - 1e-9:
-        return ("lower_bound", max(r for (r, _, _, _) in per_opponent) + 400)
-    if total_score <= 1e-9:
-        return ("upper_bound", min(r for (r, _, _, _) in per_opponent) - 400)
+    max_rating = max(r for (r, _, _, _) in per_opponent)
+    min_rating = min(r for (r, _, _, _) in per_opponent)
 
-    lo, hi = 0.0, 5000.0
+    if total_score >= total_games - 1e-9:
+        return ("lower_bound", max_rating + 400)
+    if total_score <= 1e-9:
+        return ("upper_bound", min_rating - 400)
+
+    lo = min(0.0, float(min_rating) - 1500.0)
+    hi = max(5000.0, float(max_rating) + 1500.0)
     while hi - lo > 0.5:
         mid = (lo + hi) / 2.0
         if expected_total(mid) < total_score:
@@ -572,6 +611,152 @@ def confidence_interval_95(per_opponent):
         return None
     se = 400.0 / (math.log(10.0) * math.sqrt(total_games * p * (1.0 - p)))
     return 1.96 * se
+
+
+def format_time_multiplier(multiplier):
+    mult = float(multiplier)
+    return f"{int(mult)}x" if mult.is_integer() else f"{mult:g}x"
+
+
+def _normalize_opponent_results(per_opponent_results):
+    pool = []
+    for row in per_opponent_results:
+        if len(row) == 5:
+            _, r, w, d, l = row
+        else:
+            r, w, d, l = row
+        if w + d + l > 0:
+            pool.append((r, w, d, l))
+    return pool
+
+
+def should_run_high_elo_extension(per_opponent_results):
+    """Return True when standard-pool results indicate a ~3600+ top engine."""
+    pool = _normalize_opponent_results(per_opponent_results)
+    if not pool:
+        return False
+    estimate = estimate_elo_vs_pool(pool)
+    if estimate is None or estimate[0] == "upper_bound":
+        return False
+    kind, elo = estimate
+
+    top_pool = [(r, w, d, l) for (r, w, d, l) in pool if r >= HIGH_ELO_TOP_BRACKET]
+    if top_pool:
+        top_games = sum(w + d + l for _, w, d, l in top_pool)
+        top_score = sum(w + 0.5 * d for _, w, d, l in top_pool)
+        if top_games == 0 or (top_score / top_games) < HIGH_ELO_MIN_TOP_SCORE - 1e-9:
+            return False
+    else:
+        max_r = max(r for r, _, _, _ in pool)
+        near_top = [(r, w, d, l) for (r, w, d, l) in pool if r >= max_r - 100]
+        nt_games = sum(w + d + l for _, w, d, l in near_top)
+        nt_score = sum(w + 0.5 * d for _, w, d, l in near_top)
+        if kind != "lower_bound" and (nt_games == 0 or (nt_score / nt_games) < 0.75 - 1e-9):
+            return False
+
+    return kind == "lower_bound" or elo >= HIGH_ELO_TRIGGER_RATING - 1e-9
+
+
+def select_high_elo_anchor(working_opponents, adjudicator_path=None,
+                           adjudicator_available=False, configured_opponents=()):
+    """Choose the strongest non-Maia engine available for >3600 time-odds tiers."""
+    best_opp = None
+    for path, rating in working_opponents:
+        if path and (best_opp is None or rating >= best_opp[1]):
+            best_opp = (path, rating)
+
+    if best_opp is not None and best_opp[1] >= HIGH_ELO_TOP_BRACKET:
+        return best_opp
+
+    if adjudicator_available and adjudicator_path and not is_maia_engine(None, adjudicator_path):
+        norm_adj = os.path.normcase(os.path.normpath(adjudicator_path))
+        matched_ratings = [
+            r for p, r in configured_opponents
+            if p and os.path.normcase(os.path.normpath(p)) == norm_adj
+        ]
+        adj_rating = max(matched_ratings) if matched_ratings else HIGH_ELO_DEFAULT_ANCHOR_RATING
+        if best_opp is None or adj_rating >= best_opp[1]:
+            return (adjudicator_path, adj_rating)
+
+    return best_opp
+
+
+def build_high_elo_tiers(anchor_path, anchor_rating, tiers=None):
+    """Build fixed >3600 Elo opponent tiers as (path, calibrated_elo, time_multiplier)."""
+    if not anchor_path:
+        return []
+    if tiers is None:
+        tiers = HIGH_ELO_TIME_ODDS_TIERS
+    threshold = max(3600, anchor_rating)
+    return [
+        (anchor_path, int(anchor_rating + bonus), float(mult))
+        for mult, bonus in tiers
+        if anchor_rating + bonus > threshold
+    ]
+
+
+_UNSET = object()
+
+
+def get_pool_max_extended_elo(opponents=None, adjudicator_path=_UNSET, tiers=None):
+    """Return (extension_tier_count, max_elo) for menu summary display."""
+    if opponents is None:
+        opponents = OPPONENTS
+    if adjudicator_path is _UNSET:
+        adjudicator_path = ADJUDICATOR_PATH
+    if tiers is None:
+        tiers = HIGH_ELO_TIME_ODDS_TIERS
+    non_maia = [(p, r) for p, r in opponents if p and not is_maia_engine(None, p)]
+    anchor = select_high_elo_anchor(
+        non_maia,
+        adjudicator_path=adjudicator_path,
+        adjudicator_available=bool(adjudicator_path),
+        configured_opponents=opponents,
+    )
+    base_max = max((r for _, r in opponents), default=0)
+    if anchor is None:
+        return 0, base_max
+    ext_tiers = build_high_elo_tiers(anchor[0], anchor[1], tiers=tiers)
+    if not ext_tiers:
+        return 0, base_max
+    return len(ext_tiers), max(base_max, max(r for _, r, _ in ext_tiers))
+
+
+def select_extension_openings(tier_count, games_per_opponent=None,
+                              openings=None, rng=None):
+    """Assign paired openings per tier so White and Black play the same book line."""
+    if games_per_opponent is None:
+        games_per_opponent = GAMES_PER_OPPONENT
+    if openings is None:
+        openings = HIGH_ELO_OPENINGS
+    if tier_count <= 0 or games_per_opponent <= 0 or not openings:
+        return [[None] * max(0, games_per_opponent) for _ in range(max(0, tier_count))]
+
+    pairs_per_tier = games_per_opponent // 2
+    total_pairs = tier_count * pairs_per_tier
+    chooser = rng if rng is not None else random
+    deck = []
+    while len(deck) < total_pairs:
+        batch = list(openings)
+        chooser.shuffle(batch)
+        if deck and len(batch) > 1 and batch[0] == deck[-1]:
+            batch[0], batch[-1] = batch[-1], batch[0]
+        deck.extend(batch)
+
+    schedule = []
+    pair_cursor = 0
+    for _ in range(tier_count):
+        tier_games = []
+        for _ in range(pairs_per_tier):
+            opening = deck[pair_cursor]
+            pair_cursor += 1
+            tier_games.append(opening)
+            tier_games.append(opening)
+        if games_per_opponent % 2 == 1:
+            # Leave any unpaired odd game on standard startpos for fairness.
+            tier_games.append(None)
+        schedule.append(tier_games)
+    return schedule
 
 # ----------------------------------------------------------------------
 # SYSTEM RESOURCE DETECTION
@@ -1253,11 +1438,12 @@ def draw_board(surface, board_fen, pos, animation=None, last_move=None):
 # TOURNAMENT WORKER
 # ----------------------------------------------------------------------
 class TournamentWorker(threading.Thread):
-    def __init__(self, target_path, progress_queue, settings=None):
+    def __init__(self, target_path, progress_queue, settings=None, rng=None):
         super().__init__(daemon=True)
         self.target_path = target_path
         self.queue = progress_queue
         self.settings = settings or {}
+        self._rng = rng
         self.board = chess.Board()
         self.running = True
         self.total_games = GAMES_PER_OPPONENT * len(OPPONENTS)
@@ -1285,7 +1471,41 @@ class TournamentWorker(threading.Thread):
         self.opponent_engine = None
         self.adjudicator_engine = None
         self.current_opponent_path = None
+        self.current_opponent_time_multiplier = 1.0
+        self.current_opening_name = ""
+        self._current_game_token = None
+        self.high_elo_extended = False
+        self.extension_start_index = None
         self.opponent_reloaded = False
+
+    def stop(self):
+        self.running = False
+        for eng in (self.target_engine, self.opponent_engine, self.adjudicator_engine):
+            if eng is None:
+                continue
+            protocol = getattr(eng, "protocol", None)
+            loop = getattr(protocol, "loop", None)
+            if loop is not None and protocol is not None:
+                def _abort_engine(proto=protocol):
+                    try:
+                        proto.send_line("stop")
+                    except Exception:
+                        pass
+                    transport = getattr(proto, "transport", None)
+                    if transport is not None:
+                        try:
+                            transport.kill()
+                        except Exception:
+                            pass
+                try:
+                    loop.call_soon_threadsafe(_abort_engine)
+                    continue
+                except Exception:
+                    pass
+            try:
+                eng.close()
+            except Exception:
+                pass
 
     def _launch_engine(self, path, is_adjudicator=False):
         eng = chess.engine.SimpleEngine.popen(CompatibleUciProtocol, path)
@@ -1343,19 +1563,29 @@ class TournamentWorker(threading.Thread):
         except Exception:
             pass
 
+    def _apply_opponent_metadata(self, engine, path):
+        mult = getattr(self, "current_opponent_time_multiplier", 1.0)
+        base_name = get_engine_name(engine, os.path.basename(path) if path else self.opponent_name)
+        if mult > 1.0:
+            mult_label = format_time_multiplier(mult)
+            self.opponent_name = f"{base_name} ({mult_label} time)"
+        elif base_name:
+            self.opponent_name = base_name
+        cfg_str = format_config(
+            build_engine_config(engine, path=path, settings=self.settings))
+        if mult > 1.0:
+            opp_time = self.settings.get("time", TIME_LIMIT) * mult
+            self.opponent_config_str = f"{cfg_str}, Move={opp_time:.2f}s ({format_time_multiplier(mult)})"
+        else:
+            self.opponent_config_str = cfg_str
+
     def _reload_opponent(self):
         self.queue.put(("status", "Reloading opponent engine…"))
         self._kill_engine(self.opponent_engine)
         self.opponent_engine = self._launch_engine(self.current_opponent_path,
                                                     is_adjudicator=False)
         try:
-            name = get_engine_name(self.opponent_engine, self.opponent_name)
-            if name:
-                self.opponent_name = name
-            self.opponent_config_str = format_config(
-                build_engine_config(self.opponent_engine,
-                                    path=self.current_opponent_path,
-                                    settings=self.settings))
+            self._apply_opponent_metadata(self.opponent_engine, self.current_opponent_path)
         except Exception:
             pass
 
@@ -1372,6 +1602,13 @@ class TournamentWorker(threading.Thread):
         fallback = {"target": self.target_name, "opponent": self.opponent_name,
                     "adjudicator": "Adjudicator"}.get(role, role.capitalize())
         name = get_engine_name(engine, fallback)
+        extra_meta = []
+        mult = getattr(self, "current_opponent_time_multiplier", 1.0)
+        if mult != 1.0:
+            extra_meta.append(f"Opponent time odds: {mult:g}x")
+        opening_name = getattr(self, "current_opening_name", "")
+        if opening_name:
+            extra_meta.append(f"Opening: {opening_name}")
         report = "\n".join([
             "Eloify engine error report",
             summary,
@@ -1384,6 +1621,7 @@ class TournamentWorker(threading.Thread):
             f"Opponent executable: {self.current_opponent_path}",
             f"Adjudicator executable: {ADJUDICATOR_PATH}",
             f"Settings: {self.settings!r}",
+            *extra_meta,
             f"Completed games: {self.games_played}",
             f"Position (FEN): {board.fen()}",
             "Moves (UCI): " + " ".join(move.uci() for move in board.move_stack),
@@ -1402,19 +1640,30 @@ class TournamentWorker(threading.Thread):
     def _safe_play(self, board, role):
         consecutive_target_fails = 0
         failures = []
-        time_limit = self.settings.get("time", TIME_LIMIT)
+        base_time = self.settings.get("time", TIME_LIMIT)
+        if role == "opponent":
+            time_limit = base_time * getattr(self, "current_opponent_time_multiplier", 1.0)
+        else:
+            time_limit = base_time
         while True:
             if not self.running:
                 raise TournamentAborted()
             engine = self.target_engine if role == "target" else self.opponent_engine
             try:
-                result = engine.play(board, chess.engine.Limit(time=time_limit))
+                game_token = getattr(self, "_current_game_token", None)
+                if game_token is not None:
+                    result = engine.play(board, chess.engine.Limit(time=time_limit),
+                                         game=game_token)
+                else:
+                    result = engine.play(board, chess.engine.Limit(time=time_limit))
                 if result is None or result.move is None:
                     raise ValueError("Engine returned no move")
                 if result.move not in board.legal_moves:
                     raise ValueError(f"Engine returned illegal move: {result.move}")
                 return result
             except Exception as e:
+                if not self.running:
+                    raise TournamentAborted() from e
                 failures.append(f"Attempt {len(failures) + 1}: {_exception_message(e)}\n"
                                 + _engine_failure_details(e, engine))
                 self.queue.put(("status", f"{role.capitalize()} engine error: {_exception_message(e)}"))
@@ -1456,6 +1705,8 @@ class TournamentWorker(threading.Thread):
             try:
                 return self.adjudicator_engine.analyse(board, chess.engine.Limit(time=0.2))
             except Exception as e:
+                if not self.running:
+                    return None
                 self.queue.put(("status", f"Adjudicator error: {e}"))
                 try:
                     self._reload_adjudicator()
@@ -1464,6 +1715,68 @@ class TournamentWorker(threading.Thread):
                     self.adjudicator_engine = None
                     return None
         return None
+
+    def _play_opponent_match(self, opp_path, opp_rating, opp_idx, label,
+                             time_multiplier=1.0, openings_for_games=None):
+        self.current_opponent_path = opp_path
+        self.current_opponent_time_multiplier = float(time_multiplier)
+        self.opponent_reloaded = False
+        try:
+            self.opponent_engine = self._launch_engine(opp_path, is_adjudicator=False)
+        except Exception as launch_err:
+            self.queue.put(("status", f"{label} launch failed, skipping: {launch_err}"))
+            self.current_opponent_time_multiplier = 1.0
+            return False, False
+
+        is_maia = is_maia_engine(self.opponent_engine, opp_path)
+        self.opponent_rating = opp_rating
+        self.current_opponent_index = opp_idx
+        self._apply_opponent_metadata(self.opponent_engine, opp_path)
+        if is_maia:
+            self.queue.put(("status", f"Opponent: {self.opponent_name} (Maia — NPS=1 applied)"))
+
+        per_game = []
+        try:
+            for game_idx in range(GAMES_PER_OPPONENT):
+                if not self.running:
+                    break
+                target_is_white = (game_idx % 2 == 0)
+                opening = (openings_for_games[game_idx]
+                           if openings_for_games and game_idx < len(openings_for_games)
+                           else None)
+                try:
+                    result = self.play_game(target_is_white, opening=opening)
+                except OpponentDead:
+                    self.queue.put(("status",
+                        f"Opponent '{self.opponent_name}' died twice — skipping remaining games"))
+                    break
+                except TournamentAborted:
+                    self.running = False
+                    break
+                if result is None:
+                    break
+                per_game.append(result)
+                self.games_played += 1
+                if result == "W":
+                    self.wins += 1
+                elif result == "D":
+                    self.draws += 1
+                else:
+                    self.losses += 1
+        finally:
+            self._kill_engine(self.opponent_engine)
+            self.opponent_engine = None
+            self.current_opponent_time_multiplier = 1.0
+            self.current_opening_name = ""
+
+        w = per_game.count("W")
+        d = per_game.count("D")
+        l = per_game.count("L")
+        if w + d + l > 0:
+            self.per_opponent_results.append(
+                (self.opponent_name, opp_rating, w, d, l))
+            return True, (not is_maia)
+        return False, False
 
     def run(self):
         try:
@@ -1492,61 +1805,64 @@ class TournamentWorker(threading.Thread):
                 self._kill_engine(self.target_engine)
                 return
 
+            working_opponents = []
             for opp_idx, (opp_path, opp_rating) in enumerate(OPPONENTS):
                 if not self.running:
                     break
                 self.queue.put(("status", f"Launching opponent {opp_idx + 1}…"))
-                self.current_opponent_path = opp_path
-                self.opponent_reloaded = False
-                try:
-                    self.opponent_engine = self._launch_engine(opp_path, is_adjudicator=False)
-                except Exception as launch_err:
-                    self.queue.put(("status",
-                        f"Opponent {opp_idx + 1} launch failed, skipping: {launch_err}"))
-                    continue
-                self.opponent_name = get_engine_name(self.opponent_engine,
-                                                     os.path.basename(opp_path))
-                self.opponent_rating = opp_rating
-                self.current_opponent_index = opp_idx
-                self.opponent_config_str = format_config(
-                    build_engine_config(self.opponent_engine, path=opp_path,
-                                        settings=self.settings))
-                if is_maia_engine(self.opponent_engine, opp_path):
-                    self.queue.put(("status",
-                        f"Opponent: {self.opponent_name} (Maia — NPS=1 applied)"))
+                played, can_scale = self._play_opponent_match(
+                    opp_path, opp_rating, opp_idx, f"Opponent {opp_idx + 1}")
+                if played and can_scale:
+                    working_opponents.append((opp_path, opp_rating))
 
-                per_game = []
-                for game_idx in range(GAMES_PER_OPPONENT):
-                    if not self.running:
-                        break
-                    target_is_white = (game_idx % 2 == 0)
-                    try:
-                        result = self.play_game(target_is_white)
-                    except OpponentDead:
-                        self.queue.put(("status",
-                            f"Opponent '{self.opponent_name}' died twice — skipping remaining games"))
-                        break
-                    except TournamentAborted:
-                        self.running = False
-                        break
-                    if result is None:
-                        break
-                    per_game.append(result)
-                    self.games_played += 1
-                    if result == "W":
-                        self.wins += 1
-                    elif result == "D":
-                        self.draws += 1
-                    else:
-                        self.losses += 1
-                w = per_game.count("W")
-                d = per_game.count("D")
-                l = per_game.count("L")
-                if w + d + l > 0:
-                    self.per_opponent_results.append(
-                        (self.opponent_name, opp_rating, w, d, l))
-                self._kill_engine(self.opponent_engine)
-                self.opponent_engine = None
+            if (self.running
+                    and self.games_played > 0
+                    and should_run_high_elo_extension(self.per_opponent_results)):
+                adjudicator_usable = (
+                    self.adjudicator_engine is not None
+                    and not is_maia_engine(self.adjudicator_engine, ADJUDICATOR_PATH)
+                )
+                anchor = select_high_elo_anchor(
+                    working_opponents,
+                    adjudicator_path=ADJUDICATOR_PATH,
+                    adjudicator_available=adjudicator_usable,
+                    configured_opponents=OPPONENTS,
+                )
+                if anchor is not None:
+                    ext_tiers = build_high_elo_tiers(anchor[0], anchor[1])
+                    if ext_tiers:
+                        self.high_elo_extended = True
+                        self.extension_start_index = len(self.per_opponent_results)
+                        self.total_games = (
+                            self.games_played + GAMES_PER_OPPONENT * len(ext_tiers)
+                        )
+                        ext_openings = select_extension_openings(
+                            len(ext_tiers),
+                            games_per_opponent=GAMES_PER_OPPONENT,
+                            rng=self._rng,
+                        )
+                        self.queue.put((
+                            "status",
+                            f"Top engine detected — extending test beyond 3600 Elo "
+                            f"(up to {ext_tiers[-1][1]} Elo)…",
+                        ))
+                        for tier_idx, (t_path, t_rating, t_mult) in enumerate(ext_tiers):
+                            if not self.running:
+                                break
+                            mult_label = format_time_multiplier(t_mult)
+                            self.queue.put((
+                                "status",
+                                f"Extended tier {tier_idx + 1}/{len(ext_tiers)}: "
+                                f"{t_rating} Elo ({mult_label} move time)…",
+                            ))
+                            self._play_opponent_match(
+                                t_path,
+                                t_rating,
+                                len(OPPONENTS) + tier_idx,
+                                f"Extended tier {tier_idx + 1}",
+                                time_multiplier=t_mult,
+                                openings_for_games=ext_openings[tier_idx],
+                            )
 
             self._kill_engine(self.target_engine)
             self._kill_engine(self.adjudicator_engine)
@@ -1567,12 +1883,31 @@ class TournamentWorker(threading.Thread):
             self._kill_engine(self.opponent_engine)
             self._kill_engine(self.adjudicator_engine)
 
-    def play_game(self, target_is_white):
+    def play_game(self, target_is_white, opening=None):
         self.board.reset()
+        self._current_game_token = object()
         self.current_move_number = 0
         self.last_move_san = ""
         self.last_move_uci = ""
         self.recent_moves = []
+        self.current_opening_name = ""
+        if opening:
+            opening_name, opening_moves = opening
+            self.current_opening_name = opening_name
+            for uci_move in opening_moves:
+                move = chess.Move.from_uci(uci_move)
+                if move not in self.board.legal_moves:
+                    break
+                try:
+                    san = self.board.san(move)
+                except Exception:
+                    san = uci_move
+                self.board.push(move)
+                self.last_move_san = san
+                self.last_move_uci = uci_move
+                self.recent_moves.append(san)
+            if len(self.recent_moves) > 12:
+                self.recent_moves = self.recent_moves[-12:]
         self.current_fen_shared = self.board.fen()
         self.target_is_white = target_is_white
         self.last_game_was_checkmate = False
@@ -1709,6 +2044,7 @@ class EloifyApp:
         self.error_report = ""
         self.error_clipboard_status = ""
         self.error_scroll = 0
+        self.results_scroll = 0
         self._error_lines = None
         self.start_time = None
 
@@ -1950,7 +2286,10 @@ class EloifyApp:
         elif self.cfg_hash < 64:
             warnings["hash"] = ("Engines may be weakened — very little hash", GOLD)
         if self.cfg_time > 0.5:
-            warnings["time"] = ("Long per-move time — tournament will be slow", GOLD)
+            warnings["time"] = (
+                "Long per-move time — tournament (especially 3600+ tiers) will be slow",
+                GOLD,
+            )
         return warnings
 
     def _format_slider_value(self, key):
@@ -2633,6 +2972,25 @@ class EloifyApp:
                 self._copy_error_report()
             elif event.key == pygame.K_ESCAPE:
                 self.reset()
+        elif self.state == "DONE":
+            w = getattr(self, "worker", None)
+            rows = [r for r in getattr(w, "per_opponent_results", ())
+                    if r[2] + r[3] + r[4] > 0]
+            visible = globals().get("RESULTS_VISIBLE_ROWS", 13)
+            max_scroll = max(0, len(rows) - visible)
+            cur = getattr(self, "results_scroll", 0)
+            if event.key == pygame.K_UP:
+                self.results_scroll = max(0, cur - 1)
+            elif event.key == pygame.K_DOWN:
+                self.results_scroll = min(max_scroll, cur + 1)
+            elif event.key == pygame.K_PAGEUP:
+                self.results_scroll = max(0, cur - visible)
+            elif event.key == pygame.K_PAGEDOWN:
+                self.results_scroll = min(max_scroll, cur + visible)
+            elif event.key == pygame.K_HOME:
+                self.results_scroll = 0
+            elif event.key == pygame.K_END:
+                self.results_scroll = max_scroll
 
     def handle_key_up(self, event):
         if self.state == "BROWSE_ENGINE":
@@ -2647,6 +3005,14 @@ class EloifyApp:
     def handle_mouse_wheel(self, event):
         if self.state == "DONE" and self.error_text:
             self.error_scroll = max(0, self.error_scroll - event.y * 3)
+        elif self.state == "DONE":
+            w = getattr(self, "worker", None)
+            rows = [r for r in getattr(w, "per_opponent_results", ())
+                    if r[2] + r[3] + r[4] > 0]
+            visible = globals().get("RESULTS_VISIBLE_ROWS", 13)
+            max_scroll = max(0, len(rows) - visible)
+            cur = getattr(self, "results_scroll", 0) - event.y * 3
+            self.results_scroll = max(0, min(cur, max_scroll))
         elif self.state == "BROWSE_ENGINE":
             if BROWSE_LIST.collidepoint(self.mouse_pos):
                 self.browse_scroll -= event.y
@@ -2706,6 +3072,7 @@ class EloifyApp:
         self.error_report = ""
         self.error_clipboard_status = ""
         self.error_scroll = 0
+        self.results_scroll = 0
         self._error_lines = None
         self.status_text = "Starting tournament…"
         self.start_time = time.time()
@@ -2749,9 +3116,18 @@ class EloifyApp:
                         self.estimated_elo = None
                         self.estimate_kind = None
                         self.confidence = None
+                        self.results_scroll = 0
                     else:
                         self.estimate_kind, self.estimated_elo = estimate[0]
                         self.confidence = estimate[1]
+                        w = getattr(self, "worker", None)
+                        if getattr(w, "high_elo_extended", False):
+                            rows = [r for r in getattr(w, "per_opponent_results", ())
+                                    if r[2] + r[3] + r[4] > 0]
+                            visible = globals().get("RESULTS_VISIBLE_ROWS", 13)
+                            self.results_scroll = max(0, len(rows) - visible)
+                        else:
+                            self.results_scroll = 0
                     if self.drumroll_sound and self.estimated_elo is not None and not self.error_text:
                         try:
                             self.drumroll_sound.play()
@@ -3151,14 +3527,21 @@ class EloifyApp:
                               "SYSTEM", left_rows, accent=ACCENT)
         self._draw_edit_button(self.edit_system_rect)
 
+        ext_tier_count, ext_max_elo = get_pool_max_extended_elo()
+        base_games = len(OPPONENTS) * GAMES_PER_OPPONENT
+        ext_games = ext_tier_count * GAMES_PER_OPPONENT
+        opp_value = (f"{len(OPPONENTS)} (+{ext_tier_count} top)"
+                     if ext_tier_count > 0 else str(len(OPPONENTS)))
+        games_value = (f"{base_games} (+{ext_games} top)"
+                       if ext_games > 0 else str(base_games))
         right_rows = [
-            ("Opponents", str(len(OPPONENTS)), TEXT_COLOR),
+            ("Opponents", opp_value, TEXT_COLOR),
             ("Games / opponent", str(GAMES_PER_OPPONENT), TEXT_COLOR),
-            ("Total games", str(len(OPPONENTS) * GAMES_PER_OPPONENT), GOLD),
+            ("Total games", games_value, GOLD),
         ]
         if OPPONENTS:
             lo = min(r for _, r in OPPONENTS)
-            hi = max(r for _, r in OPPONENTS)
+            hi = max(max(r for _, r in OPPONENTS), ext_max_elo)
             right_rows.append(("Rating range", f"{lo} – {hi}", TEXT_COLOR))
         self._draw_stat_panel(pygame.Rect(520, 176, 420, 184),
                               "ENGINE POOL", right_rows, accent=GOLD)
@@ -3209,14 +3592,20 @@ class EloifyApp:
         if w is None:
             return
         self._update_animation()
-        draw_text(self.screen, "Tournament in Progress", (30, 20), 26, ACCENT, bold=True)
+        in_extension = (getattr(w, "high_elo_extended", False)
+                        and w.current_opponent_index >= len(OPPONENTS))
+        header_title = ("High-Elo Extension (3600+)"
+                        if in_extension else "Tournament in Progress")
+        header_color = GOLD if in_extension else ACCENT
+        draw_text(self.screen, header_title, (30, 20), 26, header_color, bold=True)
         elapsed = int(time.time() - self.start_time) if self.start_time else 0
         elapsed_str = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
         draw_text(self.screen, f"Elapsed  {elapsed_str}", (830, 26), 18, DIM_TEXT)
         draw_text(self.screen, f"Target: {w.target_name}", (30, 60), 20, TEXT_COLOR, bold=True)
         draw_text(self.screen, f"Opponent: {w.opponent_name}  ·  {w.opponent_rating} Elo",
                   (30, 86), 20, DIM_TEXT)
-        draw_text(self.screen, f"Game {w.games_played + 1} / {w.total_games}",
+        shown_game = min(w.games_played + 1, max(1, w.total_games))
+        draw_text(self.screen, f"Game {shown_game} / {w.total_games}",
                   (830, 60), 18, DIM_TEXT)
         draw_text(self.screen, f"W {w.wins}", (790, 86), 18, WIN_COLOR)
         draw_text(self.screen, f"D {w.draws}", (845, 86), 18, DRAW_COLOR)
@@ -3266,12 +3655,15 @@ class EloifyApp:
 
         draw_section(self.screen, "CURRENT GAME", (x, y + 262), width=420)
         side = "White" if w.target_is_white else "Black"
+        opening_label = getattr(w, "current_opening_name", "")
+        side_desc = (f"Target plays {side}  ·  {opening_label}"
+                     if opening_label else f"Target plays {side}")
         dot_cx = x + 8
         dot_cy = y + 296
         dot_color = (245, 245, 245) if w.target_is_white else (15, 15, 15)
         pygame.draw.circle(self.screen, dot_color, (dot_cx, dot_cy), 7)
         pygame.draw.circle(self.screen, BORDER, (dot_cx, dot_cy), 7, width=1)
-        draw_text(self.screen, f"Target plays {side}", (x + 22, y + 286), 16, TEXT_COLOR)
+        draw_text(self.screen, side_desc, (x + 22, y + 286), 16, TEXT_COLOR)
         draw_text(self.screen,
                   f"Move {w.current_move_number}   ·   Last: {w.last_move_san or '—'}",
                   (x, y + 310), 16, DIM_TEXT)
@@ -3349,7 +3741,10 @@ class EloifyApp:
                 self.screen,
                 f"Games {w.games_played}    W {w.wins}  D {w.draws}  L {w.losses}    Score {score:.1%}",
                 (WINDOW_WIDTH // 2, 292), 16, DIM_TEXT)
-            draw_text_centered(self.screen, f"Config: {w.target_config_str}",
+            cfg_line = f"Config: {w.target_config_str}"
+            if getattr(w, "high_elo_extended", False):
+                cfg_line += "    ·    3600+ Extended"
+            draw_text_centered(self.screen, cfg_line,
                                (WINDOW_WIDTH // 2, 314), 14, DIM_TEXT)
 
             draw_section(self.screen, "PER-OPPONENT RESULTS", (50, 348), width=900)
@@ -3360,20 +3755,35 @@ class EloifyApp:
             for cx, h, c in zip(col_x, headers, hdr_colors):
                 draw_text(self.screen, h, (cx, row_y), 15, c, bold=True)
             row_y += 22
-            for idx, (name, rating, ww, dd, ll) in enumerate(w.per_opponent_results):
+
+            rows = [
+                (orig_idx, name, rating, ww, dd, ll)
+                for orig_idx, (name, rating, ww, dd, ll) in enumerate(w.per_opponent_results)
+                if ww + dd + ll > 0
+            ]
+            ext_start = getattr(w, "extension_start_index", None)
+            visible = RESULTS_VISIBLE_ROWS
+            max_scroll = max(0, len(rows) - visible)
+            self.results_scroll = max(0, min(getattr(self, "results_scroll", 0), max_scroll))
+            list_top_y = row_y
+
+            for view_idx, (orig_idx, name, rating, ww, dd, ll) in enumerate(
+                rows[self.results_scroll:self.results_scroll + visible]
+            ):
                 total = ww + dd + ll
-                if total == 0:
-                    continue
                 pct = (ww + 0.5 * dd) / total * 100.0
                 frac = (ww + 0.5 * dd) / total
-                if idx % 2 == 0:
+                if (self.results_scroll + view_idx) % 2 == 0:
                     pygame.draw.rect(self.screen, PANEL,
                                      pygame.Rect(40, row_y - 2,
-                                                 WINDOW_WIDTH - 80, 20),
+                                                 WINDOW_WIDTH - 96, 20),
                                      border_radius=3)
                 disp = name if len(name) <= 48 else name[:45] + "…"
+                is_ext_row = ext_start is not None and orig_idx >= ext_start
+                rating_color = GOLD if is_ext_row else TEXT_COLOR
                 draw_text(self.screen, disp, (col_x[0], row_y), 14, TEXT_COLOR)
-                draw_text(self.screen, f"{rating}", (col_x[1], row_y), 14, TEXT_COLOR)
+                draw_text(self.screen, f"{rating}", (col_x[1], row_y), 14,
+                          rating_color, bold=is_ext_row)
                 draw_text(self.screen, f"{ww}", (col_x[2], row_y), 14, WIN_COLOR)
                 draw_text(self.screen, f"{dd}", (col_x[3], row_y), 14, DRAW_COLOR)
                 draw_text(self.screen, f"{ll}", (col_x[4], row_y), 14, LOSS_COLOR)
@@ -3385,7 +3795,25 @@ class EloifyApp:
                     sc = DRAW_COLOR
                 draw_text(self.screen, f"{pct:5.1f}%", (col_x[5], row_y), 14, sc, bold=True)
                 row_y += 22
-        draw_text_centered(self.screen, "Click anywhere to run another test.",
+
+            if max_scroll > 0:
+                bar_x = WINDOW_WIDTH - 48
+                bar_y = list_top_y
+                bar_h = visible * 22 - 4
+                thumb_h = max(24, int(bar_h * visible / len(rows)))
+                thumb_y = bar_y + int((bar_h - thumb_h) * self.results_scroll / max_scroll)
+                pygame.draw.rect(self.screen, (60, 66, 80),
+                                 pygame.Rect(bar_x, bar_y, 4, bar_h), border_radius=2)
+                pygame.draw.rect(self.screen, ACCENT,
+                                 pygame.Rect(bar_x, thumb_y, 4, thumb_h), border_radius=2)
+
+            footer_hint = (
+                "Scroll for all opponents  ·  Click anywhere to run another test."
+                if max_scroll > 0 else "Click anywhere to run another test."
+            )
+        else:
+            footer_hint = "Click anywhere to run another test."
+        draw_text_centered(self.screen, footer_hint,
                            (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 25), 16, DIM_TEXT)
         self._update_and_draw_confetti()
 
@@ -3408,6 +3836,7 @@ class EloifyApp:
         self.error_report = ""
         self.error_clipboard_status = ""
         self.error_scroll = 0
+        self.results_scroll = 0
         self._error_lines = None
         self.worker = None
         self.animation = None
@@ -3429,7 +3858,10 @@ class EloifyApp:
 
     def shutdown(self):
         if self.worker and self.worker.is_alive():
-            self.worker.running = False
+            if hasattr(self.worker, "stop"):
+                self.worker.stop()
+            else:
+                self.worker.running = False
             self.worker.join(timeout=2)
         try:
             pygame.key.set_repeat()

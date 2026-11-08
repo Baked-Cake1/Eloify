@@ -35,3 +35,24 @@ actual applied hash size in the engine configuration.
 Engine startup now waits for `readyok` after applying options. Configuration-time
 crashes are reported immediately with the applied options and recent engine
 output, rather than being retried as ten move failures.
+
+## High-Elo (>3600) top-engine extension
+
+When a target engine performs at top-engine strength in the standard pool
+(preliminary rating **≥ 3550** and scoring **≥ 50%** against the 3500+ bracket),
+Eloify automatically extends the tournament beyond 3600 Elo:
+
+- **Fixed time-odds tiers up to ~4000+ Elo**: Eloify runs the strongest
+  available non-Maia engine (such as Stockfish 19 at 3660 Elo) with **2x, 4x,
+  8x, 16x, and 32x** per-move search time while keeping the target engine at its
+  configured `1x` move time, producing calibrated tiers at **3740, 3815, 3885,
+  3950, and 4010 Elo**.
+- **Paired book openings for 3600+ matches**: Standard-pool games still start
+  from the normal move-1 starting position (`startpos`), while each 2-game
+  3600+ extension match uses a curated grandmaster book line played once with
+  White and once with Black so top engines do not repeat identical `startpos`
+  draws.
+- **Fast runs for weaker engines**: Engines below the top-engine threshold skip
+  the time-odds stage automatically. On the final summary screen, the
+  per-opponent table scrolls with the mouse wheel or arrow/PageUp/PageDown/Home/End
+  keys to inspect all tiers.
