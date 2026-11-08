@@ -1,0 +1,7 @@
+# Downloaded networks, runtime files, and temporary installer artifacts
+*.pb.gz
+*.pb.gz.part
+*.dll
+*.exe
+.lc0-install-*/
+__pycache__/
