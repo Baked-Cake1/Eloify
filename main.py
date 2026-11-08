@@ -6,11 +6,13 @@ import queue
 import time
 import math
 import os
+import io
 import stat
 import sys
 import subprocess
 import random
 import array
+import wave
 import platform
 import warnings
 import re
@@ -23,6 +25,15 @@ from datetime import datetime
 # CONFIGURATION
 # ----------------------------------------------------------------------
 FOX_CHESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engines", "fox-chess")
+AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
+AUDIO_SOUND_FILES = {
+    "castle":     "castle.mp3",
+    "game-start": "game-start.mp3",
+    "game-end":   "game-end.mp3",
+    "move-self":  "move-self.mp3",
+    "move-check": "move-check.mp3",
+    "promote":    "promote.mp3",
+}
 
 def detect_fox_cpu():
     """Return usable instruction flags and CPU identity; fail closed on detection errors."""
@@ -1024,8 +1035,45 @@ def format_config(settings):
     return ", ".join(parts) if parts else "default"
 
 # ----------------------------------------------------------------------
-# SOUND SYNTHESIS
+# AUDIO LOADING & FALLBACK SYNTHESIS
 # ----------------------------------------------------------------------
+def _samples_to_sound(samples, sr=22050):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(samples.tobytes())
+    buf.seek(0)
+    return pygame.mixer.Sound(file=buf)
+
+
+def _resolve_audio_file(filename, audio_dir=None):
+    base_dir = AUDIO_DIR if audio_dir is None else audio_dir
+    exact = os.path.join(base_dir, filename)
+    if os.path.isfile(exact):
+        return exact
+    if os.path.isdir(base_dir):
+        target_lower = filename.lower()
+        try:
+            for entry in os.listdir(base_dir):
+                if entry.lower() == target_lower:
+                    candidate = os.path.join(base_dir, entry)
+                    if os.path.isfile(candidate):
+                        return candidate
+        except OSError:
+            pass
+    return None
+
+
+def _load_sound_file(path):
+    try:
+        return pygame.mixer.Sound(path)
+    except Exception:
+        with open(path, "rb") as f:
+            return pygame.mixer.Sound(file=io.BytesIO(f.read()))
+
+
 def _generate_drumroll(duration=REVEAL_DURATION, sr=22050):
     n = int(duration * sr)
     samples = array.array('h', bytes(n * 2))
@@ -1062,7 +1110,8 @@ def _generate_drumroll(duration=REVEAL_DURATION, sr=22050):
                 val += math.sin(2 * math.pi * f * t) * ct * 0.04
         val = max(-1.0, min(1.0, val))
         samples[i] = int(val * 26000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+    return _samples_to_sound(samples, sr=sr)
+
 
 def _generate_celebration(duration=1.6, sr=22050):
     n = int(duration * sr)
@@ -1090,7 +1139,8 @@ def _generate_celebration(duration=1.6, sr=22050):
         val += (random.random() * 2 - 1) * 0.05 * math.exp(-t * 3.0)
         val = max(-1.0, min(1.0, val))
         samples[i] = int(val * 28000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+    return _samples_to_sound(samples, sr=sr)
+
 
 def _generate_move_sound(duration=0.05, sr=22050):
     n = int(duration * sr)
@@ -1101,18 +1151,43 @@ def _generate_move_sound(duration=0.05, sr=22050):
         val = math.sin(2 * math.pi * 620 * t) * env * 0.55
         val += math.sin(2 * math.pi * 260 * t) * env * 0.25
         samples[i] = int(max(-1.0, min(1.0, val)) * 12000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+    return _samples_to_sound(samples, sr=sr)
 
-def _generate_capture_sound(duration=0.09, sr=22050):
+
+def _generate_castle_sound(duration=0.11, sr=22050):
     n = int(duration * sr)
     samples = array.array('h', bytes(n * 2))
     for i in range(n):
         t = i / sr
-        env = math.exp(-t * 40)
-        val = (random.random() * 2 - 1) * 0.7 * env
-        val += math.sin(2 * math.pi * 180 * t) * env * 0.35
-        samples[i] = int(max(-1.0, min(1.0, val)) * 14000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+        val = 0.0
+        env1 = math.exp(-t * 85)
+        val += math.sin(2 * math.pi * 580 * t) * env1 * 0.50
+        val += math.sin(2 * math.pi * 240 * t) * env1 * 0.25
+        if t >= 0.045:
+            dt = t - 0.045
+            env2 = math.exp(-dt * 85)
+            val += math.sin(2 * math.pi * 700 * dt) * env2 * 0.50
+            val += math.sin(2 * math.pi * 290 * dt) * env2 * 0.25
+        samples[i] = int(max(-1.0, min(1.0, val)) * 13000)
+    return _samples_to_sound(samples, sr=sr)
+
+
+def _generate_promote_sound(duration=0.22, sr=22050):
+    n = int(duration * sr)
+    samples = array.array('h', bytes(n * 2))
+    notes = [(0.00, 587.33), (0.06, 880.00)]
+    for i in range(n):
+        t = i / sr
+        val = 0.0
+        for start, freq in notes:
+            if t >= start:
+                dt = t - start
+                attack = min(1.0, dt / 0.006)
+                env = attack * math.exp(-dt * 18)
+                val += math.sin(2 * math.pi * freq * dt) * env * 0.40
+        samples[i] = int(max(-1.0, min(1.0, val)) * 16000)
+    return _samples_to_sound(samples, sr=sr)
+
 
 def _generate_check_sound(duration=0.4, sr=22050):
     n = int(duration * sr)
@@ -1131,37 +1206,30 @@ def _generate_check_sound(duration=0.4, sr=22050):
             val += math.sin(2 * math.pi * 1975.53 * dt) * env2 * 0.08
         val = max(-1.0, min(1.0, val))
         samples[i] = int(val * 18000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+    return _samples_to_sound(samples, sr=sr)
 
-def _generate_checkmate_sound(duration=1.6, sr=22050):
+
+def _generate_game_start_sound(duration=0.18, sr=22050):
     n = int(duration * sr)
     samples = array.array('h', bytes(n * 2))
-    gong_partials = [(1.0, 1.0, 1.2), (2.7, 0.6, 2.0), (4.2, 0.4, 2.5),
-                     (5.4, 0.3, 3.0), (7.1, 0.2, 3.5)]
-    base_freq = 110.0
-    fall_notes = [(0.0, 392.00), (0.20, 349.23), (0.40, 261.63)]
+    notes = [(0.00, 440.00), (0.06, 587.33)]
     for i in range(n):
         t = i / sr
         val = 0.0
-        gong_attack = min(1.0, t / 0.005)
-        for ratio, amp, decay in gong_partials:
-            env = gong_attack * math.exp(-t * decay)
-            val += math.sin(2 * math.pi * base_freq * ratio * t) * env * amp * 0.14
-        for start, freq in fall_notes:
+        for start, freq in notes:
             if t >= start:
                 dt = t - start
-                attack = min(1.0, dt / 0.02)
-                env = attack * math.exp(-dt * 2.0)
-                val += math.sin(2 * math.pi * freq * dt) * env * 0.18
-                val += math.sin(2 * math.pi * freq * 1.005 * dt) * env * 0.09
-        val = max(-1.0, min(1.0, val))
-        samples[i] = int(val * 24000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+                attack = min(1.0, dt / 0.008)
+                env = attack * math.exp(-dt * 20)
+                val += math.sin(2 * math.pi * freq * dt) * env * 0.35
+        samples[i] = int(max(-1.0, min(1.0, val)) * 16000)
+    return _samples_to_sound(samples, sr=sr)
 
-def _generate_win_sound(duration=1.0, sr=22050):
+
+def _generate_game_end_sound(duration=0.35, sr=22050):
     n = int(duration * sr)
     samples = array.array('h', bytes(n * 2))
-    notes = [(0.00, 523.25), (0.09, 659.25), (0.18, 783.99), (0.27, 1046.50)]
+    notes = [(0.00, 523.25), (0.10, 659.25)]
     for i in range(n):
         t = i / sr
         val = 0.0
@@ -1169,48 +1237,50 @@ def _generate_win_sound(duration=1.0, sr=22050):
             if t >= start:
                 dt = t - start
                 attack = min(1.0, dt / 0.01)
-                env = attack * math.exp(-dt * 3.0)
-                val += math.sin(2 * math.pi * freq * dt) * env * 0.30
-                val += math.sin(2 * math.pi * freq * 2 * dt) * env * 0.07
-        val = max(-1.0, min(1.0, val))
-        samples[i] = int(val * 22000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+                env = attack * math.exp(-dt * 9)
+                val += math.sin(2 * math.pi * freq * dt) * env * 0.35
+        samples[i] = int(max(-1.0, min(1.0, val)) * 18000)
+    return _samples_to_sound(samples, sr=sr)
 
-def _generate_loss_sound(duration=1.0, sr=22050):
-    n = int(duration * sr)
-    samples = array.array('h', bytes(n * 2))
-    notes = [(0.00, 392.00), (0.22, 311.13), (0.44, 261.63)]
-    for i in range(n):
-        t = i / sr
-        val = 0.0
-        for start, freq in notes:
-            if t >= start:
-                dt = t - start
-                attack = min(1.0, dt / 0.02)
-                env = attack * math.exp(-dt * 2.2)
-                vib = math.sin(2 * math.pi * 5.5 * dt) * 0.01
-                val += math.sin(2 * math.pi * freq * (1 + vib) * dt) * env * 0.28
-        val = max(-1.0, min(1.0, val))
-        samples[i] = int(val * 21000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
 
-def _generate_draw_sound(duration=0.7, sr=22050):
-    n = int(duration * sr)
-    samples = array.array('h', bytes(n * 2))
-    notes = [(0.00, 523.25), (0.18, 698.46)]
-    for i in range(n):
-        t = i / sr
-        val = 0.0
-        for start, freq in notes:
-            if t >= start:
-                dt = t - start
-                attack = min(1.0, dt / 0.015)
-                env = attack * math.exp(-dt * 3.5)
-                val += math.sin(2 * math.pi * freq * dt) * env * 0.25
-                val += math.sin(2 * math.pi * freq * 2 * dt) * env * 0.05
-        val = max(-1.0, min(1.0, val))
-        samples[i] = int(val * 20000)
-    return pygame.mixer.Sound(buffer=samples.tobytes())
+_SOUND_FALLBACK_GENERATORS = {
+    "castle":     _generate_castle_sound,
+    "game-start": _generate_game_start_sound,
+    "game-end":   _generate_game_end_sound,
+    "move-self":  _generate_move_sound,
+    "move-check": _generate_check_sound,
+    "promote":    _generate_promote_sound,
+}
+
+
+def _load_game_sounds(audio_dir=None, sound_files=None):
+    base_dir = AUDIO_DIR if audio_dir is None else audio_dir
+    mapping = AUDIO_SOUND_FILES if sound_files is None else sound_files
+    loaded = {}
+    missing = []
+    for key, filename in mapping.items():
+        resolved = _resolve_audio_file(filename, audio_dir=base_dir)
+        snd = None
+        if resolved is not None:
+            try:
+                snd = _load_sound_file(resolved)
+            except Exception as exc:
+                warnings.warn(f"Could not load sound '{resolved}': {exc}")
+        if snd is None:
+            missing.append(filename)
+            gen = _SOUND_FALLBACK_GENERATORS.get(key)
+            if gen is not None:
+                try:
+                    snd = gen()
+                except Exception:
+                    snd = None
+        loaded[key] = snd
+    if missing:
+        warnings.warn(
+            f"Missing or unreadable audio files in '{base_dir}' "
+            f"({', '.join(missing)}); using built-in fallback sounds."
+        )
+    return loaded
 
 # ----------------------------------------------------------------------
 # EASING
@@ -1503,6 +1573,22 @@ class TournamentWorker(threading.Thread):
         self.high_elo_extended = False
         self.extension_start_index = None
         self.opponent_reloaded = False
+        self.sound_events = deque(maxlen=512)
+
+    @staticmethod
+    def _classify_move_sound(is_check=False, is_promotion=False, is_castling=False):
+        if is_check:
+            return "move-check"
+        if is_promotion:
+            return "promote"
+        if is_castling:
+            return "castle"
+        return "move-self"
+
+    def _emit_sound(self, sound_key):
+        events = getattr(self, "sound_events", None)
+        if events is not None:
+            events.append(sound_key)
 
     def stop(self):
         self.running = False
@@ -1937,6 +2023,9 @@ class TournamentWorker(threading.Thread):
         self.current_fen_shared = self.board.fen()
         self.target_is_white = target_is_white
         self.last_game_was_checkmate = False
+        if not self.running:
+            raise TournamentAborted()
+        self._emit_sound("game-start")
         max_moves = 300
         while (not self.board.is_game_over()) and self.current_move_number < max_moves:
             if not self.running:
@@ -1946,11 +2035,19 @@ class TournamentWorker(threading.Thread):
             else:
                 role = "opponent"
             result = self._safe_play(self.board, role)
+            is_castling = self.board.is_castling(result.move)
+            is_promotion = result.move.promotion is not None
             try:
                 san = self.board.san(result.move)
             except Exception:
                 san = result.move.uci()
             self.board.push(result.move)
+            is_check = self.board.is_check()
+            self._emit_sound(self._classify_move_sound(
+                is_check=is_check,
+                is_promotion=is_promotion,
+                is_castling=is_castling,
+            ))
             self.current_move_number += 1
             self.last_move_san = san
             self.last_move_uci = result.move.uci()
@@ -1968,7 +2065,11 @@ class TournamentWorker(threading.Thread):
         except Exception:
             self.last_game_was_checkmate = False
         if outcome is None:
+            if not self.running:
+                raise TournamentAborted()
             info = self._safe_analyse(self.board)
+            if not self.running:
+                raise TournamentAborted()
             white_wins = None
             if info is not None:
                 try:
@@ -1983,26 +2084,34 @@ class TournamentWorker(threading.Thread):
                     pass
             if white_wins is None:
                 self.last_game_result = "Draw (adjudicated)"
+                self._emit_sound("game-end")
                 return "D"
             if white_wins == target_is_white:
                 self.last_game_result = "Target wins (adjudicated)"
+                self._emit_sound("game-end")
                 return "W"
             self.last_game_result = "Opponent wins (adjudicated)"
+            self._emit_sound("game-end")
             return "L"
         if outcome.winner is None:
             self.last_game_result = f"Draw ({outcome.termination.name})"
+            self._emit_sound("game-end")
             return "D"
         if outcome.winner == chess.WHITE:
             if target_is_white:
                 self.last_game_result = "Target wins (1-0)"
+                self._emit_sound("game-end")
                 return "W"
             self.last_game_result = "Opponent wins (1-0)"
+            self._emit_sound("game-end")
             return "L"
         else:
             if target_is_white:
                 self.last_game_result = "Opponent wins (0-1)"
+                self._emit_sound("game-end")
                 return "L"
             self.last_game_result = "Target wins (0-1)"
+            self._emit_sound("game-end")
             return "W"
 
 # ----------------------------------------------------------------------
@@ -2010,12 +2119,13 @@ class TournamentWorker(threading.Thread):
 # ----------------------------------------------------------------------
 class EloifyApp:
     def __init__(self):
-        pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=512)
+        pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
         pygame.init()
         _init_font_family()
 
         try:
             pygame.mixer.set_num_channels(24)
+            pygame.mixer.set_reserved(len(AUDIO_SOUND_FILES))
         except Exception:
             pass
 
@@ -2025,36 +2135,38 @@ class EloifyApp:
 
         self.drumroll_sound    = None
         self.celebration_sound = None
+        self.sounds            = {}
+        self.sound_channels    = {}
+        self.castle_sound      = None
+        self.game_start_sound  = None
+        self.game_end_sound    = None
         self.move_sound        = None
-        self.capture_sound     = None
         self.check_sound       = None
-        self.checkmate_sound   = None
-        self.win_sound         = None
-        self.loss_sound        = None
-        self.draw_sound        = None
-
-        self.ch_check     = None
-        self.ch_checkmate = None
-        self.ch_win       = None
-        self.ch_loss      = None
-        self.ch_draw      = None
+        self.promote_sound     = None
 
         if pygame.mixer.get_init():
             try:
                 self.drumroll_sound    = _generate_drumroll()
                 self.celebration_sound = _generate_celebration()
-                self.move_sound        = _generate_move_sound()
-                self.capture_sound     = _generate_capture_sound()
-                self.check_sound       = _generate_check_sound()
-                self.checkmate_sound   = _generate_checkmate_sound()
-                self.win_sound         = _generate_win_sound()
-                self.loss_sound        = _generate_loss_sound()
-                self.draw_sound        = _generate_draw_sound()
-                self.ch_check     = pygame.mixer.Channel(0)
-                self.ch_checkmate = pygame.mixer.Channel(1)
-                self.ch_win       = pygame.mixer.Channel(2)
-                self.ch_loss      = pygame.mixer.Channel(3)
-                self.ch_draw      = pygame.mixer.Channel(4)
+            except Exception:
+                pass
+            try:
+                self.sounds            = _load_game_sounds()
+                self.castle_sound      = self.sounds.get("castle")
+                self.game_start_sound  = self.sounds.get("game-start")
+                self.game_end_sound    = self.sounds.get("game-end")
+                self.move_sound        = self.sounds.get("move-self")
+                self.check_sound       = self.sounds.get("move-check")
+                self.promote_sound     = self.sounds.get("promote")
+                for idx, key in enumerate((
+                    "game-start",
+                    "game-end",
+                    "move-self",
+                    "move-check",
+                    "castle",
+                    "promote",
+                )):
+                    self.sound_channels[key] = pygame.mixer.Channel(idx)
             except Exception:
                 pass
 
@@ -3318,25 +3430,6 @@ class EloifyApp:
                 self.animation = self._make_animation(prev_fen,
                                                       w.current_fen_shared,
                                                       w.last_move_uci)
-                if self.animation is not None and w.last_move_san:
-                    is_capture = "x" in w.last_move_san
-                    snd = self.capture_sound if (is_capture and self.capture_sound) else self.move_sound
-                    if snd is not None:
-                        try:
-                            snd.play()
-                        except Exception:
-                            pass
-                try:
-                    b = _get_board(w.current_fen_shared)
-                    if b.is_checkmate():
-                        pass
-                    elif b.is_check() and self.check_sound and self.ch_check is not None:
-                        try:
-                            self.ch_check.play(self.check_sound)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
             else:
                 self.animation = None
                 self.last_move_from = None
@@ -3344,36 +3437,62 @@ class EloifyApp:
         if self.animation is not None and self.animation.done():
             self.animation = None
 
+    def _play_game_sound(self, sound_key):
+        sounds = getattr(self, "sounds", None) or {}
+        snd = sounds.get(sound_key)
+        if snd is None:
+            attr_map = {
+                "castle":     "castle_sound",
+                "game-start": "game_start_sound",
+                "game-end":   "game_end_sound",
+                "move-self":  "move_sound",
+                "move-check": "check_sound",
+                "promote":    "promote_sound",
+            }
+            attr = attr_map.get(sound_key)
+            if attr:
+                snd = getattr(self, attr, None)
+        if snd is None:
+            return
+        channels = getattr(self, "sound_channels", None) or {}
+        ch = channels.get(sound_key)
+        try:
+            if ch is not None:
+                ch.play(snd)
+            else:
+                snd.play()
+        except Exception:
+            pass
+
     def _update_game_sounds(self):
         w = self.worker
         if w is None:
             return
+        events = getattr(w, "sound_events", None)
+        if events is not None:
+            if getattr(self, "error_text", None):
+                events.clear()
+                return
+            batch = []
+            seen = set()
+            while True:
+                try:
+                    ev = events.popleft()
+                except IndexError:
+                    break
+                if ev not in seen:
+                    seen.add(ev)
+                    batch.append(ev)
+            for ev in batch:
+                self._play_game_sound(ev)
+            self.last_games_played = w.games_played
+            self.last_wins         = w.wins
+            self.last_draws        = w.draws
+            self.last_losses       = w.losses
+            return
+
         if w.games_played > self.last_games_played:
-            if getattr(w, "last_game_was_checkmate", False):
-                if self.checkmate_sound and self.ch_checkmate is not None:
-                    try:
-                        self.ch_checkmate.play(self.checkmate_sound)
-                    except Exception:
-                        pass
-            else:
-                new_wins   = w.wins   - self.last_wins
-                new_draws  = w.draws  - self.last_draws
-                new_losses = w.losses - self.last_losses
-                if new_wins > 0 and self.win_sound and self.ch_win is not None:
-                    try:
-                        self.ch_win.play(self.win_sound)
-                    except Exception:
-                        pass
-                elif new_losses > 0 and self.loss_sound and self.ch_loss is not None:
-                    try:
-                        self.ch_loss.play(self.loss_sound)
-                    except Exception:
-                        pass
-                elif new_draws > 0 and self.draw_sound and self.ch_draw is not None:
-                    try:
-                        self.ch_draw.play(self.draw_sound)
-                    except Exception:
-                        pass
+            self._play_game_sound("game-end")
             self.last_games_played = w.games_played
             self.last_wins         = w.wins
             self.last_draws        = w.draws
