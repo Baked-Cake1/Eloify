@@ -63,3 +63,14 @@ When choosing an engine executable, hidden folders and files (dotfiles/dotfolder
 Windows `FILE_ATTRIBUTE_HIDDEN` items, and macOS `UF_HIDDEN` items) are hidden by
 default. Tick **Show hidden folders/files** in the browse toolbar (or press
 **Ctrl+H** on Windows/Linux, **Cmd+Shift+.** on macOS) to display them.
+
+## Audio sound effects
+
+Eloify loads chess sound effects from the `audio/` folder beside `main.py`:
+
+- `castle.mp3` — castling (`O-O` / `O-O-O`)
+- `game-start.mp3` — when a game starts
+- `game-end.mp3` — when a game finishes (win, draw, loss, checkmate, adjudication, etc.)
+- `move-self.mp3` — piece moves and captures
+- `move-check.mp3` — moves that deliver check
+- `promote.mp3` — pawn promotions
