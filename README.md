@@ -56,3 +56,10 @@ Eloify automatically extends the tournament beyond 3600 Elo:
   the time-odds stage automatically. On the final summary screen, the
   per-opponent table scrolls with the mouse wheel or arrow/PageUp/PageDown/Home/End
   keys to inspect all tiers.
+
+## Browse Engine dialog
+
+When choosing an engine executable, hidden folders and files (dotfiles/dotfolders,
+Windows `FILE_ATTRIBUTE_HIDDEN` items, and macOS `UF_HIDDEN` items) are hidden by
+default. Tick **Show hidden folders/files** in the browse toolbar (or press
+**Ctrl+H** on Windows/Linux, **Cmd+Shift+.** on macOS) to display them.
