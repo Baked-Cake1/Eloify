@@ -6,6 +6,7 @@ import queue
 import time
 import math
 import os
+import stat
 import sys
 import subprocess
 import random
@@ -231,17 +232,42 @@ SLIDER_CONFIGS = [
 ]
 
 # Browse dialog layout
-BROWSE_PANEL         = pygame.Rect(50, 60, 900, 620)
-BROWSE_FIELD         = pygame.Rect(80, 120, 840, 38)
-BROWSE_UP_RECT       = pygame.Rect(80, 172, 60, 30)
-BROWSE_HOME_RECT     = pygame.Rect(148, 172, 72, 30)
-BROWSE_REFRESH_RECT  = pygame.Rect(228, 172, 84, 30)
-BROWSE_LIST          = pygame.Rect(80, 214, 840, 356)
-BROWSE_INFO_Y        = 582
-BROWSE_CANCEL_RECT   = pygame.Rect(740, 612, 90, 38)
-BROWSE_OPEN_RECT     = pygame.Rect(840, 612, 90, 38)
-BROWSE_ROW_HEIGHT    = 24
-BROWSE_FIELD_PADDING = 8
+BROWSE_PANEL             = pygame.Rect(50, 60, 900, 620)
+BROWSE_FIELD             = pygame.Rect(80, 120, 840, 38)
+BROWSE_UP_RECT           = pygame.Rect(80, 172, 60, 30)
+BROWSE_HOME_RECT         = pygame.Rect(148, 172, 72, 30)
+BROWSE_REFRESH_RECT      = pygame.Rect(228, 172, 84, 30)
+BROWSE_SHOW_HIDDEN_RECT  = pygame.Rect(664, 172, 256, 30)
+BROWSE_SHOW_HIDDEN_LABEL = "Show hidden folders/files"
+BROWSE_LIST              = pygame.Rect(80, 214, 840, 356)
+BROWSE_INFO_Y            = 582
+BROWSE_CANCEL_RECT       = pygame.Rect(740, 612, 90, 38)
+BROWSE_OPEN_RECT         = pygame.Rect(840, 612, 90, 38)
+BROWSE_ROW_HEIGHT        = 24
+BROWSE_FIELD_PADDING     = 8
+
+FILE_ATTRIBUTE_HIDDEN = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 0x2)
+UF_HIDDEN = getattr(stat, "UF_HIDDEN", 0x8000)
+
+
+def _is_hidden_entry(entry):
+    """Return True when a directory entry or path is hidden on Windows, macOS, or Linux."""
+    name = entry.name if hasattr(entry, "name") else os.path.basename(str(entry))
+    if name in ("", ".", ".."):
+        return False
+    if name.startswith("."):
+        return True
+    try:
+        st = (entry.stat(follow_symlinks=False)
+              if hasattr(entry, "stat")
+              else os.stat(entry, follow_symlinks=False))
+    except OSError:
+        return False
+    if getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_HIDDEN:
+        return True
+    if getattr(st, "st_flags", 0) & UF_HIDDEN:
+        return True
+    return False
 
 SELECTION_BG   = (55, 95, 135)
 FIELD_BG       = (20, 24, 30)
@@ -2082,6 +2108,8 @@ class EloifyApp:
         self.browse_entries = []
         self.browse_selected = -1
         self.browse_scroll = 0
+        self.browse_show_hidden = False
+        self.browse_hidden_count = 0
         self.browse_error = ""
         self.browse_focus = "text"      # "text" or "list"
         self.browse_path_field = TextField("")
@@ -2407,6 +2435,9 @@ class EloifyApp:
         self.browse_path_field.select_all()
         self.browse_selected = -1
         self.browse_scroll = 0
+        if not hasattr(self, "browse_show_hidden"):
+            self.browse_show_hidden = False
+        self.browse_hidden_count = 0
         self.browse_error = ""
         self.browse_focus = "text"
         self.browse_drag_active = False
@@ -2442,6 +2473,8 @@ class EloifyApp:
 
     def _refresh_dir_listing(self):
         entries = []
+        hidden_count = 0
+        show_hidden = getattr(self, "browse_show_hidden", False)
         self.browse_error = ""
         try:
             items = list(os.scandir(self.browse_cwd))
@@ -2449,6 +2482,9 @@ class EloifyApp:
             files = []
             for e in items:
                 try:
+                    if _is_hidden_entry(e) and not show_hidden:
+                        hidden_count += 1
+                        continue
                     if e.is_dir():
                         dirs.append(e)
                     else:
@@ -2470,8 +2506,35 @@ class EloifyApp:
         except Exception as e:
             self.browse_error = f"Error: {e}"
         self.browse_entries = entries
+        self.browse_hidden_count = hidden_count
         if self.browse_selected >= len(self.browse_entries):
             self.browse_selected = -1
+
+    def _toggle_browse_show_hidden(self):
+        prev_selected_path = None
+        if 0 <= self.browse_selected < len(self.browse_entries):
+            prev_selected_path = self.browse_entries[self.browse_selected][2]
+
+        self.browse_show_hidden = not getattr(self, "browse_show_hidden", False)
+        self._refresh_dir_listing()
+
+        if prev_selected_path is not None:
+            norm_prev = os.path.normpath(prev_selected_path)
+            for i, (_, _, full) in enumerate(self.browse_entries):
+                if os.path.normpath(full) == norm_prev:
+                    self.browse_selected = i
+                    self._browse_ensure_visible()
+                    break
+            else:
+                self.browse_selected = -1
+        else:
+            self.browse_selected = -1
+
+        visible_rows = BROWSE_LIST.h // BROWSE_ROW_HEIGHT
+        max_scroll = max(0, len(self.browse_entries) - visible_rows)
+        self.browse_scroll = max(0, min(self.browse_scroll, max_scroll))
+        self._last_browse_click_time = 0.0
+        self._last_browse_click_idx = -1
 
     def _browse_goto(self, path):
         path = os.path.normpath(path)
@@ -2570,6 +2633,9 @@ class EloifyApp:
         if BROWSE_REFRESH_RECT.collidepoint(pos):
             self._refresh_dir_listing()
             return
+        if BROWSE_SHOW_HIDDEN_RECT.collidepoint(pos):
+            self._toggle_browse_show_hidden()
+            return
         if BROWSE_FIELD.collidepoint(pos):
             self.browse_focus = "text"
             field = self.browse_path_field
@@ -2643,6 +2709,15 @@ class EloifyApp:
                     self.browse_selected = -1
                     self.browse_focus = "text"
                     self.browse_error = ""
+                return
+            if key == pygame.K_h and sys.platform != "darwin":
+                if hasattr(self, "_toggle_browse_show_hidden"):
+                    self._toggle_browse_show_hidden()
+                return
+            if (sys.platform == "darwin" and shift
+                    and (key == pygame.K_PERIOD or event.unicode in (".", ">"))):
+                if hasattr(self, "_toggle_browse_show_hidden"):
+                    self._toggle_browse_show_hidden()
                 return
 
         if first:
@@ -2734,6 +2809,35 @@ class EloifyApp:
         pygame.draw.rect(self.screen, border, rect, width=1, border_radius=6)
         surf = _render_text(label, 14, text_color, True)
         self.screen.blit(surf, surf.get_rect(center=rect.center))
+
+    def _draw_browse_checkbox(self, rect, label, checked=False):
+        hovered = rect.collidepoint(self.mouse_pos)
+        fill = PANEL_HOVER if hovered else (44, 50, 60)
+        border = ACCENT if (hovered or checked) else BORDER
+        pygame.draw.rect(self.screen, fill, rect, border_radius=6)
+        pygame.draw.rect(self.screen, border, rect, width=1, border_radius=6)
+
+        box_size = 16
+        box_rect = pygame.Rect(
+            rect.x + 10,
+            rect.centery - box_size // 2,
+            box_size,
+            box_size,
+        )
+        if checked:
+            pygame.draw.rect(self.screen, ACCENT, box_rect, border_radius=4)
+            p1 = (box_rect.x + 3, box_rect.centery)
+            p2 = (box_rect.x + 6, box_rect.bottom - 4)
+            p3 = (box_rect.right - 3, box_rect.y + 4)
+            pygame.draw.lines(self.screen, (12, 24, 18), False, [p1, p2, p3], 2)
+        else:
+            pygame.draw.rect(self.screen, (20, 24, 30), box_rect, border_radius=4)
+            box_border = ACCENT if hovered else (110, 118, 132)
+            pygame.draw.rect(self.screen, box_border, box_rect, width=1, border_radius=4)
+
+        label_color = TEXT_COLOR if (checked or hovered) else DIM_TEXT
+        surf = _render_text(label, 14, label_color, True)
+        self.screen.blit(surf, (box_rect.right + 9, rect.centery - surf.get_height() // 2))
 
     def _draw_browse_button(self, rect, label, primary=False):
         hovered = rect.collidepoint(self.mouse_pos)
@@ -2911,6 +3015,11 @@ class EloifyApp:
         self._draw_browse_tool_button(BROWSE_UP_RECT, "↑ Up", enabled=parent_ok)
         self._draw_browse_tool_button(BROWSE_HOME_RECT, "Home")
         self._draw_browse_tool_button(BROWSE_REFRESH_RECT, "Refresh")
+        self._draw_browse_checkbox(
+            BROWSE_SHOW_HIDDEN_RECT,
+            BROWSE_SHOW_HIDDEN_LABEL,
+            checked=getattr(self, "browse_show_hidden", False),
+        )
 
         # List
         pygame.draw.rect(self.screen, LIST_BG, BROWSE_LIST, border_radius=8)
@@ -2925,6 +3034,9 @@ class EloifyApp:
             n_dirs = sum(1 for e in self.browse_entries if e[1] and e[0] != "..")
             n_files = sum(1 for e in self.browse_entries if not e[1])
             info_text = f"{n_dirs} folders  ·  {n_files} files"
+            hidden_count = getattr(self, "browse_hidden_count", 0)
+            if hidden_count > 0 and not getattr(self, "browse_show_hidden", False):
+                info_text += f"  ({hidden_count} hidden)"
             info_color = DIM_TEXT
         draw_text(self.screen, info_text,
                   (panel.x + 30, BROWSE_INFO_Y), 13, info_color)
@@ -3854,6 +3966,8 @@ class EloifyApp:
         self.last_losses       = 0
         self.dragging_slider   = None
         self.settings_snapshot = None
+        self.browse_show_hidden = False
+        self.browse_hidden_count = 0
         self._keys_down = set()
 
     def shutdown(self):
