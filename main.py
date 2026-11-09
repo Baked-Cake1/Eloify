@@ -20,6 +20,7 @@ import tempfile
 import traceback
 from collections import deque
 from datetime import datetime
+import eloify_features as ef
 
 # ----------------------------------------------------------------------
 # CONFIGURATION
@@ -205,7 +206,7 @@ RESULTS_VISIBLE_ROWS = 13
 # ----------------------------------------------------------------------
 # UI CONSTANTS  — refined palette
 # ----------------------------------------------------------------------
-WINDOW_WIDTH, WINDOW_HEIGHT = 1000, 740
+WINDOW_WIDTH, WINDOW_HEIGHT = 1240, 780
 FPS = 60
 
 BACKGROUND   = (22, 24, 30)
@@ -221,13 +222,17 @@ WIN_COLOR    = (120, 210, 130)
 LOSS_COLOR   = (230, 110, 110)
 DRAW_COLOR   = (180, 185, 195)
 
-BOARD_SIZE = 480
+BOARD_SIZE = 440
 SQUARE_SIZE = BOARD_SIZE // 8
-BOARD_POS = (30, 140)
-INFO_POS = (540, 140)
+BOARD_POS = (56, 134)
+INFO_POS = (514, 92)
 
 BOARD_LIGHT = (238, 216, 183)
 BOARD_DARK  = (171, 122, 89)
+_ACTIVE_BOARD_LIGHT = BOARD_LIGHT
+_ACTIVE_BOARD_DARK  = BOARD_DARK
+_ACTIVE_PIECE_STYLE = "classic_2tone"
+_ACTIVE_SHOW_COORDS = True
 
 MOVE_ANIM_DURATION = 0.10
 
@@ -242,18 +247,20 @@ SLIDER_CONFIGS = [
     ("time",      "Time per Move (s)",      0.01, 10.0, 0.01, "float"),
 ]
 
-# Browse dialog layout
-BROWSE_PANEL             = pygame.Rect(50, 60, 900, 620)
-BROWSE_FIELD             = pygame.Rect(80, 120, 840, 38)
-BROWSE_UP_RECT           = pygame.Rect(80, 172, 60, 30)
-BROWSE_HOME_RECT         = pygame.Rect(148, 172, 72, 30)
-BROWSE_REFRESH_RECT      = pygame.Rect(228, 172, 84, 30)
-BROWSE_SHOW_HIDDEN_RECT  = pygame.Rect(664, 172, 256, 30)
+# Browse dialog layout (centered in WINDOW_WIDTH x WINDOW_HEIGHT)
+_BROWSE_X = (WINDOW_WIDTH - 900) // 2
+_BROWSE_Y = (WINDOW_HEIGHT - 620) // 2
+BROWSE_PANEL             = pygame.Rect(_BROWSE_X, _BROWSE_Y, 900, 620)
+BROWSE_FIELD             = pygame.Rect(_BROWSE_X + 30, _BROWSE_Y + 60, 840, 38)
+BROWSE_UP_RECT           = pygame.Rect(_BROWSE_X + 30, _BROWSE_Y + 112, 60, 30)
+BROWSE_HOME_RECT         = pygame.Rect(_BROWSE_X + 98, _BROWSE_Y + 112, 72, 30)
+BROWSE_REFRESH_RECT      = pygame.Rect(_BROWSE_X + 178, _BROWSE_Y + 112, 84, 30)
+BROWSE_SHOW_HIDDEN_RECT  = pygame.Rect(_BROWSE_X + 614, _BROWSE_Y + 112, 256, 30)
 BROWSE_SHOW_HIDDEN_LABEL = "Show hidden folders/files"
-BROWSE_LIST              = pygame.Rect(80, 214, 840, 356)
-BROWSE_INFO_Y            = 582
-BROWSE_CANCEL_RECT       = pygame.Rect(740, 612, 90, 38)
-BROWSE_OPEN_RECT         = pygame.Rect(840, 612, 90, 38)
+BROWSE_LIST              = pygame.Rect(_BROWSE_X + 30, _BROWSE_Y + 154, 840, 356)
+BROWSE_INFO_Y            = _BROWSE_Y + 522
+BROWSE_CANCEL_RECT       = pygame.Rect(_BROWSE_X + 690, _BROWSE_Y + 552, 90, 38)
+BROWSE_OPEN_RECT         = pygame.Rect(_BROWSE_X + 790, _BROWSE_Y + 552, 90, 38)
 BROWSE_ROW_HEIGHT        = 24
 BROWSE_FIELD_PADDING     = 8
 
@@ -892,6 +899,10 @@ class CompatibleUciProtocol(chess.engine.UciProtocol):
         super().__init__()
         self._movetime_stop = None
         self.diagnostics = deque(maxlen=80)
+        self.latest_nps = 0
+        self.latest_depth = 0
+        self.latest_score_cp = None
+        self.latest_score_mate = None
 
     def _cancel_movetime_stop(self):
         if self._movetime_stop is not None:
@@ -907,6 +918,9 @@ class CompatibleUciProtocol(chess.engine.UciProtocol):
         tokens = line.split()
         if tokens and tokens[0] in ("go", "stop", "quit"):
             self._cancel_movetime_stop()
+            if tokens[0] == "go":
+                self.latest_score_cp = None
+                self.latest_score_mate = None
         super().send_line(line)
         name = self.id.get("name", "")
         if (tokens and tokens[0] == "go" and "movetime" in tokens
@@ -919,7 +933,32 @@ class CompatibleUciProtocol(chess.engine.UciProtocol):
 
     def line_received(self, line):
         self.diagnostics.append("<< " + line[:2000])
-        if line.split()[:1] == ["bestmove"]:
+        tokens = line.split()
+        if tokens[:1] == ["info"]:
+            for i, tok in enumerate(tokens):
+                if tok == "nps" and i + 1 < len(tokens):
+                    try:
+                        self.latest_nps = int(tokens[i + 1])
+                    except ValueError:
+                        pass
+                elif tok == "depth" and i + 1 < len(tokens):
+                    try:
+                        self.latest_depth = int(tokens[i + 1])
+                    except ValueError:
+                        pass
+                elif tok == "score" and i + 2 < len(tokens):
+                    kind = tokens[i + 1]
+                    try:
+                        val = int(tokens[i + 2])
+                        if kind == "cp":
+                            self.latest_score_cp = val
+                            self.latest_score_mate = None
+                        elif kind == "mate":
+                            self.latest_score_mate = val
+                            self.latest_score_cp = 10000 - abs(val) * 50 if val > 0 else -10000 + abs(val) * 50
+                    except ValueError:
+                        pass
+        elif tokens[:1] == ["bestmove"]:
             self._cancel_movetime_stop()
         super().line_received(line)
 
@@ -1309,9 +1348,21 @@ def _init_font_family():
             continue
 
 def _get_font(name, size, bold=False):
+    if not pygame.font.get_init():
+        pygame.font.init()
+        _FONT_CACHE.clear()
+        _TEXT_CACHE.clear()
     key = (name, size, bold)
     f = _FONT_CACHE.get(key)
     if f is None:
+        f = pygame.font.SysFont(name, size, bold=bold)
+        _FONT_CACHE[key] = f
+    try:
+        f.get_height()
+    except Exception:
+        _FONT_CACHE.clear()
+        _TEXT_CACHE.clear()
+        pygame.font.init()
         f = pygame.font.SysFont(name, size, bold=bold)
         _FONT_CACHE[key] = f
     return f
@@ -1367,8 +1418,19 @@ def _glyph_renders(font, char):
         return False
 
 def _get_piece_font(size):
+    if not pygame.font.get_init():
+        pygame.font.init()
+        _PIECE_FONT_CACHE.clear()
+        _PIECE_CACHE.clear()
     if size in _PIECE_FONT_CACHE:
-        return _PIECE_FONT_CACHE[size]
+        cached = _PIECE_FONT_CACHE[size]
+        try:
+            cached.get_height()
+            return cached
+        except Exception:
+            _PIECE_FONT_CACHE.clear()
+            _PIECE_CACHE.clear()
+            pygame.font.init()
     for name in ["Segoe UI Symbol", "DejaVu Sans", "Arial Unicode MS",
                  "Noto Sans Symbols 2", "FreeSerif"]:
         try:
@@ -1383,11 +1445,25 @@ def _get_piece_font(size):
     return f
 
 _PIECE_SURFACE_CACHE = {}
-def _get_piece_surface(symbol, size):
-    key = (symbol, size)
+def _get_piece_surface(symbol, size, style=None):
+    active_style = style or globals().get("_ACTIVE_PIECE_STYLE", "classic_2tone")
+    accent = globals().get("ACCENT", (100, 200, 160))
+    key = (symbol, size, active_style, accent)
     surf = _PIECE_SURFACE_CACHE.get(key)
     if surf is not None:
         return surf
+    _ef = globals().get("ef")
+    if _ef is not None:
+        out = _ef.render_styled_piece(
+            symbol,
+            size,
+            style=active_style,
+            piece_font_getter=_get_piece_font,
+            text_font_getter=lambda sz, bold=False: _get_font(_FONT_FAMILY, sz, bold=bold),
+            accent=accent,
+        )
+        _PIECE_SURFACE_CACHE[key] = out
+        return out
     font = _get_piece_font(size)
     glyph = PIECE_GLYPHS[symbol]
     text = font.render(glyph, True, (0, 0, 0))
@@ -1399,57 +1475,75 @@ def _get_piece_surface(symbol, size):
     _PIECE_SURFACE_CACHE[key] = out
     return out
 
-def _sq_to_center_px(square, pos):
-    row = 7 - (square // 8)
-    col = square % 8
-    return (pos[0] + col * SQUARE_SIZE + SQUARE_SIZE // 2,
-            pos[1] + row * SQUARE_SIZE + SQUARE_SIZE // 2)
+def _sq_to_center_px(square, pos, sq_size=None, flipped=False):
+    sq_sz = sq_size or SQUARE_SIZE
+    if flipped:
+        row = square // 8
+        col = 7 - (square % 8)
+    else:
+        row = 7 - (square // 8)
+        col = square % 8
+    return (pos[0] + col * sq_sz + sq_sz // 2,
+            pos[1] + row * sq_sz + sq_sz // 2)
 
-def _draw_piece_at(surface, symbol, cx, cy):
-    size = int(SQUARE_SIZE * 0.85)
-    surf = _get_piece_surface(symbol, size)
-    surface.blit(surf, surf.get_rect(center=(cx, cy)))
+def _draw_piece_at(surface, symbol, cx, cy, sq_size=None, style=None):
+    sq_sz = sq_size or SQUARE_SIZE
+    size = int(sq_sz * 0.85)
+    surf = _get_piece_surface(symbol, size, style=style)
+    surface.blit(surf, surf.get_rect(center=(int(cx), int(cy))))
 
 # ----------------------------------------------------------------------
 # BOARD BACKGROUND + LAST-MOVE HIGHLIGHT CACHES
 # ----------------------------------------------------------------------
 _BOARD_BG_CACHE = {}
-def _get_board_bg(size):
-    surf = _BOARD_BG_CACHE.get(size)
+def _get_board_bg(size, light_col=None, dark_col=None, show_coords=None, flipped=False):
+    lcol = tuple(light_col or globals().get("_ACTIVE_BOARD_LIGHT", BOARD_LIGHT))
+    dcol = tuple(dark_col or globals().get("_ACTIVE_BOARD_DARK", BOARD_DARK))
+    coords = (globals().get("_ACTIVE_SHOW_COORDS", True)
+              if show_coords is None else bool(show_coords))
+    key = (size, lcol, dcol, coords, bool(flipped))
+    surf = _BOARD_BG_CACHE.get(key)
     if surf is not None:
         return surf
+    if len(_BOARD_BG_CACHE) > 48:
+        _BOARD_BG_CACHE.clear()
     sq = size // 8
-    surf = pygame.Surface((size, size)).convert()
+    surf = pygame.Surface((size, size))
+    if pygame.display.get_surface() is not None:
+        surf = surf.convert()
     coord_font = _get_font(_FONT_FAMILY, max(10, sq // 5), bold=True)
     for row in range(8):
         for col in range(8):
             is_light = (row + col) % 2 == 0
-            color = BOARD_LIGHT if is_light else BOARD_DARK
+            color = lcol if is_light else dcol
             rect = pygame.Rect(col * sq, row * sq, sq, sq)
             pygame.draw.rect(surf, color, rect)
             pygame.draw.rect(surf, tuple(max(0, c - 18) for c in color),
                              rect, width=1)
-            coord_color = BOARD_DARK if is_light else BOARD_LIGHT
-            if col == 0:
-                rank = str(8 - row)
-                s = coord_font.render(rank, True, coord_color)
-                surf.blit(s, (col * sq + 3, row * sq + 2))
-            if row == 7:
-                file_letter = chr(ord('a') + col)
-                s = coord_font.render(file_letter, True, coord_color)
-                surf.blit(s, (col * sq + sq - s.get_width() - 3,
-                              row * sq + sq - s.get_height() - 2))
-    _BOARD_BG_CACHE[size] = surf
+            if coords:
+                coord_color = dcol if is_light else lcol
+                if col == 0:
+                    rank = str(row + 1) if flipped else str(8 - row)
+                    s = coord_font.render(rank, True, coord_color)
+                    surf.blit(s, (col * sq + 3, row * sq + 2))
+                if row == 7:
+                    file_letter = chr(ord('h') - col) if flipped else chr(ord('a') + col)
+                    s = coord_font.render(file_letter, True, coord_color)
+                    surf.blit(s, (col * sq + sq - s.get_width() - 3,
+                                  row * sq + sq - s.get_height() - 2))
+    _BOARD_BG_CACHE[key] = surf
     return surf
 
-_LAST_MOVE_HL = None
-def _get_last_move_highlight():
-    global _LAST_MOVE_HL
-    if _LAST_MOVE_HL is None:
-        s = pygame.Surface((SQUARE_SIZE, SQUARE_SIZE), pygame.SRCALPHA)
+_LAST_MOVE_HL = {}
+def _get_last_move_highlight(sq_size=None):
+    sq_sz = sq_size or SQUARE_SIZE
+    hl = _LAST_MOVE_HL.get(sq_sz)
+    if hl is None:
+        s = pygame.Surface((sq_sz, sq_sz), pygame.SRCALPHA)
         s.fill((255, 220, 100, 72))
-        _LAST_MOVE_HL = s
-    return _LAST_MOVE_HL
+        _LAST_MOVE_HL[sq_sz] = s
+        hl = s
+    return hl
 
 _BOARD_FEN_CACHE = {}
 def _get_board(fen):
@@ -1483,18 +1577,30 @@ class MoveAnimation:
     def done(self):
         return self.progress() >= 1.0
 
-def draw_board(surface, board_fen, pos, animation=None, last_move=None):
+def draw_board(surface, board_fen, pos, animation=None, last_move=None,
+               flipped=False, show_coords=None, light_col=None, dark_col=None,
+               piece_style=None, board_size=None):
+    bsize = board_size or BOARD_SIZE
+    sq_sz = bsize // 8
     board = _get_board(board_fen)
-    surface.blit(_get_board_bg(BOARD_SIZE), pos)
+    surface.blit(
+        _get_board_bg(bsize, light_col=light_col, dark_col=dark_col,
+                      show_coords=show_coords, flipped=flipped),
+        pos,
+    )
     if last_move is not None:
-        hl = _get_last_move_highlight()
+        hl = _get_last_move_highlight(sq_sz)
         for sq in last_move:
             if sq is None:
                 continue
-            row = 7 - (sq // 8)
-            col = sq % 8
-            surface.blit(hl, (pos[0] + col * SQUARE_SIZE,
-                              pos[1] + row * SQUARE_SIZE))
+            if flipped:
+                row = sq // 8
+                col = 7 - (sq % 8)
+            else:
+                row = 7 - (sq // 8)
+                col = sq % 8
+            surface.blit(hl, (pos[0] + col * sq_sz,
+                              pos[1] + row * sq_sz))
     animating = animation is not None and not animation.done()
     skip = set()
     if animating:
@@ -1509,32 +1615,35 @@ def draw_board(surface, board_fen, pos, animation=None, last_move=None):
         piece = board.piece_at(square)
         if not piece:
             continue
-        cx, cy = _sq_to_center_px(square, pos)
-        _draw_piece_at(surface, piece.symbol(), cx, cy)
+        cx, cy = _sq_to_center_px(square, pos, sq_size=sq_sz, flipped=flipped)
+        _draw_piece_at(surface, piece.symbol(), cx, cy, sq_size=sq_sz, style=piece_style)
     if animating:
         t = animation.progress()
         if animation.captured_square is not None and animation.captured_symbol is not None:
-            cx, cy = _sq_to_center_px(animation.captured_square, pos)
-            _draw_piece_at(surface, animation.captured_symbol, cx, cy)
+            cx, cy = _sq_to_center_px(animation.captured_square, pos, sq_size=sq_sz, flipped=flipped)
+            _draw_piece_at(surface, animation.captured_symbol, cx, cy, sq_size=sq_sz, style=piece_style)
         moved = board.piece_at(animation.to_sq)
         if moved:
-            fx, fy = _sq_to_center_px(animation.from_sq, pos)
-            tx, ty = _sq_to_center_px(animation.to_sq, pos)
+            fx, fy = _sq_to_center_px(animation.from_sq, pos, sq_size=sq_sz, flipped=flipped)
+            tx, ty = _sq_to_center_px(animation.to_sq, pos, sq_size=sq_sz, flipped=flipped)
             _draw_piece_at(surface, moved.symbol(),
-                           fx + (tx - fx) * t, fy + (ty - fy) * t)
+                           fx + (tx - fx) * t, fy + (ty - fy) * t,
+                           sq_size=sq_sz, style=piece_style)
         if animation.rook_to is not None:
             rook = board.piece_at(animation.rook_to)
             if rook:
-                fx, fy = _sq_to_center_px(animation.rook_from, pos)
-                tx, ty = _sq_to_center_px(animation.rook_to, pos)
+                fx, fy = _sq_to_center_px(animation.rook_from, pos, sq_size=sq_sz, flipped=flipped)
+                tx, ty = _sq_to_center_px(animation.rook_to, pos, sq_size=sq_sz, flipped=flipped)
                 _draw_piece_at(surface, rook.symbol(),
-                               fx + (tx - fx) * t, fy + (ty - fy) * t)
+                               fx + (tx - fx) * t, fy + (ty - fy) * t,
+                               sq_size=sq_sz, style=piece_style)
 
 # ----------------------------------------------------------------------
 # TOURNAMENT WORKER
 # ----------------------------------------------------------------------
 class TournamentWorker(threading.Thread):
-    def __init__(self, target_path, progress_queue, settings=None, rng=None):
+    def __init__(self, target_path, progress_queue, settings=None, rng=None,
+                 skipped_indices=None, eval_cache=None):
         super().__init__(daemon=True)
         self.target_path = target_path
         self.queue = progress_queue
@@ -1542,7 +1651,23 @@ class TournamentWorker(threading.Thread):
         self._rng = rng
         self.board = chess.Board()
         self.running = True
-        self.total_games = GAMES_PER_OPPONENT * len(OPPONENTS)
+        self._schedule_lock = threading.Lock()
+        self.skipped_opponent_indices = set(skipped_indices or ())
+        self.schedule_entries = [
+            {
+                "index":  idx,
+                "path":   opp_path,
+                "name":   self._default_opp_label(opp_path),
+                "rating": opp_rating,
+                "status": "skipped" if idx in self.skipped_opponent_indices else "pending",
+                "w":      0,
+                "d":      0,
+                "l":      0,
+            }
+            for idx, (opp_path, opp_rating) in enumerate(OPPONENTS)
+        ]
+        active_count = sum(1 for e in self.schedule_entries if e["status"] != "skipped")
+        self.total_games = GAMES_PER_OPPONENT * active_count
         self.games_played = 0
         self.wins = 0
         self.draws = 0
@@ -1574,6 +1699,84 @@ class TournamentWorker(threading.Thread):
         self.extension_start_index = None
         self.opponent_reloaded = False
         self.sound_events = deque(maxlen=512)
+
+        # Decorative 30-second chess clocks (flag = loss on time)
+        self.chess_clock_initial = float(self.settings.get("chess_clock", 30.0))
+        self.white_clock = self.chess_clock_initial
+        self.black_clock = self.chess_clock_initial
+        self.clock_active_color = None
+        self.clock_turn_started = None
+
+        # Game replay records, move-quality Elo, and optional Engine Data tracking
+        self.eval_cache = eval_cache if eval_cache is not None else {}
+        self.game_records = []
+        self.move_quality_summary = None
+        self.last_game_move_quality = None
+        self.engine_data_tracking = bool(self.settings.get("engine_data_tracking", False))
+        _ef = globals().get("ef")
+        self.resource_tracker = _ef.EngineResourceTracker() if _ef is not None else None
+        self.resource_summary = None
+
+    @staticmethod
+    def _default_opp_label(path):
+        if not path:
+            return "Opponent"
+        base = os.path.splitext(os.path.basename(path))[0]
+        parent = os.path.basename(os.path.dirname(path))
+        if parent.lower() in ("windows", "64", "gcc", "amd 64", "stockfish"):
+            grand = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            if grand and grand.lower() not in ("chess", "engines", "stockfish"):
+                return grand
+        if parent and parent.lower().startswith("stockfish "):
+            return parent
+        return base
+
+    def toggle_skip_opponent(self, opp_idx):
+        with self._schedule_lock:
+            for entry in self.schedule_entries:
+                if entry["index"] == opp_idx:
+                    if entry["status"] == "pending":
+                        entry["status"] = "skipped"
+                        self.skipped_opponent_indices.add(opp_idx)
+                        self.total_games = max(
+                            self.games_played, self.total_games - GAMES_PER_OPPONENT
+                        )
+                        return True
+                    if entry["status"] == "skipped":
+                        entry["status"] = "pending"
+                        self.skipped_opponent_indices.discard(opp_idx)
+                        self.total_games += GAMES_PER_OPPONENT
+                        return False
+                    return None
+        return None
+
+    def is_opponent_skipped(self, opp_idx):
+        with self._schedule_lock:
+            return opp_idx in self.skipped_opponent_indices
+
+    def _update_schedule_entry(self, opp_idx, **updates):
+        with self._schedule_lock:
+            for entry in self.schedule_entries:
+                if entry["index"] == opp_idx:
+                    entry.update(updates)
+                    return
+
+    def get_schedule_snapshot(self):
+        with self._schedule_lock:
+            return [dict(e) for e in self.schedule_entries]
+
+    def get_live_clocks(self):
+        w_left = getattr(self, "white_clock", 30.0)
+        b_left = getattr(self, "black_clock", 30.0)
+        active = getattr(self, "clock_active_color", None)
+        started = getattr(self, "clock_turn_started", None)
+        if active is not None and started is not None:
+            dt = max(0.0, time.monotonic() - started)
+            if active is True:
+                w_left = max(0.0, w_left - dt)
+            elif active is False:
+                b_left = max(0.0, b_left - dt)
+        return (w_left, b_left)
 
     @staticmethod
     def _classify_move_sound(is_check=False, is_promotion=False, is_castling=False):
@@ -1622,9 +1825,10 @@ class TournamentWorker(threading.Thread):
     def _launch_engine(self, path, is_adjudicator=False):
         eng = chess.engine.SimpleEngine.popen(CompatibleUciProtocol, path)
         cfg = {}
+        eff_settings = {"threads": 1, "hash": 16} if is_adjudicator else self.settings
         try:
             cfg = build_engine_config(eng, is_adjudicator=is_adjudicator,
-                                      path=path, settings=self.settings)
+                                      path=path, settings=eff_settings)
             apply_engine_config(eng, cfg)
             # configure() only sends UCI commands. Wait for readyok so an
             # allocation failure is reported here, not as ten failed moves.
@@ -1635,10 +1839,11 @@ class TournamentWorker(threading.Thread):
             raise chess.engine.EngineError(
                 f"Engine failed during configuration/readiness: {path}\n"
                 f"Applied options: {cfg!r}\n{details}") from exc
-        requested_hash = self.settings.get("hash")
-        if requested_hash is not None and cfg.get("Hash", requested_hash) < requested_hash:
-            self.queue.put(("status", f"{get_engine_name(eng)}: using Hash={cfg['Hash']} MB "
-                            f"instead of {requested_hash} MB (compatibility/option limits)"))
+        if not is_adjudicator:
+            requested_hash = self.settings.get("hash")
+            if requested_hash is not None and cfg.get("Hash", requested_hash) < requested_hash:
+                self.queue.put(("status", f"{get_engine_name(eng)}: using Hash={cfg['Hash']} MB "
+                                f"instead of {requested_hash} MB (compatibility/option limits)"))
         return eng
 
     def _kill_engine(self, eng):
@@ -1828,14 +2033,79 @@ class TournamentWorker(threading.Thread):
                     return None
         return None
 
+    def _finalize_game_record(self, result_code, pgn_result, termination_label,
+                              target_is_white, initial_fen, opening_name, ply_records):
+        _ef = globals().get("ef")
+        eval_cache = getattr(self, "eval_cache", None) or {}
+        if eval_cache:
+            for ply in ply_records:
+                fb = ply.get("fen_before")
+                fa = ply.get("fen_after")
+                if fb in eval_cache:
+                    ply["eval_before_cp"] = eval_cache[fb][0]
+                if fa in eval_cache:
+                    ply["eval_after_cp"] = eval_cache[fa][0]
+                    ply["mate_after"] = eval_cache[fa][1]
+
+        mq = None
+        if _ef is not None and self.settings.get("move_quality_elo", True):
+            try:
+                mq = _ef.compute_game_move_quality_elo(ply_records, target_is_white)
+            except Exception:
+                mq = None
+        self.last_game_move_quality = mq
+
+        res_stats = None
+        tracker = getattr(self, "resource_tracker", None)
+        if getattr(self, "engine_data_tracking", False) and tracker is not None:
+            try:
+                res_stats = tracker.finish_game()
+                self.resource_summary = tracker.summary()
+            except Exception:
+                res_stats = None
+
+        records = getattr(self, "game_records", None)
+        if records is not None:
+            rec = {
+                "game_number":     len(records) + 1,
+                "opponent_index":  getattr(self, "current_opponent_index", 0),
+                "opponent_name":   getattr(self, "opponent_name", "Opponent"),
+                "opponent_rating": getattr(self, "opponent_rating", 0),
+                "target_name":     getattr(self, "target_name", "Target"),
+                "target_is_white": bool(target_is_white),
+                "result":          result_code,
+                "pgn_result":      pgn_result,
+                "termination":     termination_label,
+                "opening_name":    opening_name or "",
+                "initial_fen":     initial_fen,
+                "plies":           ply_records,
+                "move_quality":    mq,
+                "resource_stats":  res_stats,
+            }
+            records.append(rec)
+            if _ef is not None and self.settings.get("move_quality_elo", True):
+                try:
+                    self.move_quality_summary = _ef.aggregate_move_quality_elo(records)
+                except Exception:
+                    pass
+
     def _play_opponent_match(self, opp_path, opp_rating, opp_idx, label,
                              time_multiplier=1.0, openings_for_games=None):
+        if hasattr(self, "is_opponent_skipped") and self.is_opponent_skipped(opp_idx):
+            if hasattr(self, "_update_schedule_entry"):
+                self._update_schedule_entry(opp_idx, status="skipped")
+            self.queue.put(("status", f"Skipped {label} ({opp_rating} Elo)"))
+            return False, False
+
         self.current_opponent_path = opp_path
         self.current_opponent_time_multiplier = float(time_multiplier)
         self.opponent_reloaded = False
         try:
             self.opponent_engine = self._launch_engine(opp_path, is_adjudicator=False)
         except Exception as launch_err:
+            if hasattr(self, "_update_schedule_entry"):
+                self._update_schedule_entry(opp_idx, status="unavailable")
+            self.total_games = max(self.games_played, self.total_games - GAMES_PER_OPPONENT)
             self.queue.put(("status", f"{label} launch failed, skipping: {launch_err}"))
             self.current_opponent_time_multiplier = 1.0
             return False, False
@@ -1844,6 +2114,10 @@ class TournamentWorker(threading.Thread):
         self.opponent_rating = opp_rating
         self.current_opponent_index = opp_idx
         self._apply_opponent_metadata(self.opponent_engine, opp_path)
+        if hasattr(self, "_update_schedule_entry"):
+            self._update_schedule_entry(
+                opp_idx, name=self.opponent_name, status="playing"
+            )
         if is_maia:
             self.queue.put(("status", f"Opponent: {self.opponent_name} (Maia — NPS=1 applied)"))
 
@@ -1875,6 +2149,13 @@ class TournamentWorker(threading.Thread):
                     self.draws += 1
                 else:
                     self.losses += 1
+                if hasattr(self, "_update_schedule_entry"):
+                    self._update_schedule_entry(
+                        opp_idx,
+                        w=per_game.count("W"),
+                        d=per_game.count("D"),
+                        l=per_game.count("L"),
+                    )
         finally:
             self._kill_engine(self.opponent_engine)
             self.opponent_engine = None
@@ -1884,6 +2165,13 @@ class TournamentWorker(threading.Thread):
         w = per_game.count("W")
         d = per_game.count("D")
         l = per_game.count("L")
+        if hasattr(self, "_update_schedule_entry"):
+            self._update_schedule_entry(
+                opp_idx,
+                name=self.opponent_name,
+                status="done" if (w + d + l > 0) else "unavailable",
+                w=w, d=d, l=l,
+            )
         if w + d + l > 0:
             self.per_opponent_results.append(
                 (self.opponent_name, opp_rating, w, d, l))
@@ -1908,19 +2196,29 @@ class TournamentWorker(threading.Thread):
             else:
                 self.queue.put(("status", f"Target: {self.target_name} ({self.target_config_str})"))
 
+            if getattr(self, "engine_data_tracking", False) and getattr(self, "resource_tracker", None):
+                try:
+                    self.resource_tracker.sample(engine=self.target_engine)
+                    self.resource_summary = self.resource_tracker.summary()
+                except Exception:
+                    pass
+
             self.queue.put(("status", "Launching adjudicator…"))
             try:
                 self.adjudicator_engine = self._launch_engine(ADJUDICATOR_PATH,
                                                               is_adjudicator=True)
             except Exception as e:
-                self._report_error("Could not launch adjudicator", e, role="adjudicator")
-                self._kill_engine(self.target_engine)
-                return
+                self.adjudicator_engine = None
+                self.queue.put(("status", f"Adjudicator unavailable (continuing without): {e}"))
 
             working_opponents = []
             for opp_idx, (opp_path, opp_rating) in enumerate(OPPONENTS):
                 if not self.running:
                     break
+                if hasattr(self, "is_opponent_skipped") and self.is_opponent_skipped(opp_idx):
+                    if hasattr(self, "_update_schedule_entry"):
+                        self._update_schedule_entry(opp_idx, status="skipped")
+                    continue
                 self.queue.put(("status", f"Launching opponent {opp_idx + 1}…"))
                 played, can_scale = self._play_opponent_match(
                     opp_path, opp_rating, opp_idx, f"Opponent {opp_idx + 1}")
@@ -1945,9 +2243,27 @@ class TournamentWorker(threading.Thread):
                     if ext_tiers:
                         self.high_elo_extended = True
                         self.extension_start_index = len(self.per_opponent_results)
-                        self.total_games = (
-                            self.games_played + GAMES_PER_OPPONENT * len(ext_tiers)
+                        if hasattr(self, "_schedule_lock"):
+                            with self._schedule_lock:
+                                base_label = self._default_opp_label(anchor[0])
+                                for tier_idx, (t_path, t_rating, t_mult) in enumerate(ext_tiers):
+                                    ext_idx = len(OPPONENTS) + tier_idx
+                                    self.schedule_entries.append({
+                                        "index":  ext_idx,
+                                        "path":   t_path,
+                                        "name":   f"{base_label} ({format_time_multiplier(t_mult)})",
+                                        "rating": t_rating,
+                                        "status": "skipped" if ext_idx in self.skipped_opponent_indices else "pending",
+                                        "w":      0,
+                                        "d":      0,
+                                        "l":      0,
+                                    })
+                        active_ext = sum(
+                            1 for tier_idx in range(len(ext_tiers))
+                            if not (hasattr(self, "is_opponent_skipped")
+                                    and self.is_opponent_skipped(len(OPPONENTS) + tier_idx))
                         )
+                        self.total_games = self.games_played + GAMES_PER_OPPONENT * active_ext
                         ext_openings = select_extension_openings(
                             len(ext_tiers),
                             games_per_opponent=GAMES_PER_OPPONENT,
@@ -1961,6 +2277,11 @@ class TournamentWorker(threading.Thread):
                         for tier_idx, (t_path, t_rating, t_mult) in enumerate(ext_tiers):
                             if not self.running:
                                 break
+                            ext_idx = len(OPPONENTS) + tier_idx
+                            if hasattr(self, "is_opponent_skipped") and self.is_opponent_skipped(ext_idx):
+                                if hasattr(self, "_update_schedule_entry"):
+                                    self._update_schedule_entry(ext_idx, status="skipped")
+                                continue
                             mult_label = format_time_multiplier(t_mult)
                             self.queue.put((
                                 "status",
@@ -1970,7 +2291,7 @@ class TournamentWorker(threading.Thread):
                             self._play_opponent_match(
                                 t_path,
                                 t_rating,
-                                len(OPPONENTS) + tier_idx,
+                                ext_idx,
                                 f"Extended tier {tier_idx + 1}",
                                 time_multiplier=t_mult,
                                 openings_for_games=ext_openings[tier_idx],
@@ -2003,6 +2324,19 @@ class TournamentWorker(threading.Thread):
         self.last_move_uci = ""
         self.recent_moves = []
         self.current_opening_name = ""
+        init_clock = float(getattr(self, "chess_clock_initial", 30.0))
+        self.white_clock = init_clock
+        self.black_clock = init_clock
+        self.clock_active_color = None
+        self.clock_turn_started = None
+
+        tracker = getattr(self, "resource_tracker", None)
+        if getattr(self, "engine_data_tracking", False) and tracker is not None:
+            try:
+                tracker.start_game()
+            except Exception:
+                pass
+
         if opening:
             opening_name, opening_moves = opening
             self.current_opening_name = opening_name
@@ -2020,28 +2354,137 @@ class TournamentWorker(threading.Thread):
                 self.recent_moves.append(san)
             if len(self.recent_moves) > 12:
                 self.recent_moves = self.recent_moves[-12:]
-        self.current_fen_shared = self.board.fen()
+        initial_fen = self.board.fen()
+        self.current_fen_shared = initial_fen
         self.target_is_white = target_is_white
         self.last_game_was_checkmate = False
         if not self.running:
             raise TournamentAborted()
         self._emit_sound("game-start")
-        max_moves = 300
-        while (not self.board.is_game_over()) and self.current_move_number < max_moves:
+
+        ply_records = []
+        prev_search_white_cp = None
+
+        # Play until real chess termination (checkmate, stalemate, insufficient
+        # material, 50-move rule, threefold repetition) or 30s clock flag!
+        while not (
+            self.board.is_game_over()
+            or self.board.is_fifty_moves()
+            or self.board.is_repetition(3)
+        ):
             if not self.running:
                 raise TournamentAborted()
-            if (self.board.turn == chess.WHITE) == target_is_white:
-                role = "target"
+            mover_is_white = (self.board.turn == chess.WHITE)
+            role = "target" if (mover_is_white == target_is_white) else "opponent"
+            rem_before = self.white_clock if mover_is_white else self.black_clock
+            if rem_before <= 0.0:
+                if mover_is_white == target_is_white:
+                    self.last_game_result = "Opponent wins (on time)"
+                    res_code = "L"
+                else:
+                    self.last_game_result = "Target wins (on time)"
+                    res_code = "W"
+                pgn_res = "0-1" if mover_is_white else "1-0"
+                if hasattr(self, "_finalize_game_record"):
+                    self._finalize_game_record(
+                        res_code, pgn_res, "TIME_FORFEIT",
+                        target_is_white, initial_fen, self.current_opening_name, ply_records,
+                    )
+                self._emit_sound("game-end")
+                return res_code
+
+            fen_before = self.board.fen()
+            timed_out = [False]
+            active_eng = self.target_engine if role == "target" else self.opponent_engine
+
+            def _on_clock_expired(eng=active_eng):
+                timed_out[0] = True
+                proto = getattr(eng, "protocol", None)
+                loop = getattr(proto, "loop", None)
+                if loop is not None and proto is not None:
+                    try:
+                        loop.call_soon_threadsafe(proto.send_line, "stop")
+                    except Exception:
+                        pass
+
+            flag_timer = threading.Timer(max(0.001, rem_before), _on_clock_expired)
+            flag_timer.daemon = True
+            self.clock_active_color = mover_is_white
+            t0 = time.monotonic()
+            self.clock_turn_started = t0
+            flag_timer.start()
+            try:
+                result = self._safe_play(self.board, role)
+            except Exception:
+                flag_timer.cancel()
+                self.clock_active_color = None
+                self.clock_turn_started = None
+                if timed_out[0] and self.running:
+                    result = None
+                else:
+                    raise
             else:
-                role = "opponent"
-            result = self._safe_play(self.board, role)
+                flag_timer.cancel()
+                self.clock_active_color = None
+                self.clock_turn_started = None
+
+            dt = max(0.0, time.monotonic() - t0)
+            if mover_is_white:
+                self.white_clock = max(0.0, self.white_clock - dt)
+                rem_after = self.white_clock
+            else:
+                self.black_clock = max(0.0, self.black_clock - dt)
+                rem_after = self.black_clock
+
+            if getattr(self, "engine_data_tracking", False) and tracker is not None and role == "target":
+                try:
+                    t_proto = getattr(self.target_engine, "protocol", None)
+                    nps = getattr(t_proto, "latest_nps", 0)
+                    self.resource_summary = tracker.sample(
+                        engine=self.target_engine, latest_nps=nps
+                    )
+                except Exception:
+                    pass
+
+            if timed_out[0] or rem_after <= 0.0 or result is None or getattr(result, "move", None) is None:
+                if mover_is_white:
+                    self.white_clock = 0.0
+                else:
+                    self.black_clock = 0.0
+                if mover_is_white == target_is_white:
+                    self.last_game_result = "Opponent wins (on time)"
+                    res_code = "L"
+                else:
+                    self.last_game_result = "Target wins (on time)"
+                    res_code = "W"
+                pgn_res = "0-1" if mover_is_white else "1-0"
+                if hasattr(self, "_finalize_game_record"):
+                    self._finalize_game_record(
+                        res_code, pgn_res, "TIME_FORFEIT",
+                        target_is_white, initial_fen, self.current_opening_name, ply_records,
+                    )
+                self._emit_sound("game-end")
+                return res_code
+
+            # Capture engine's own search score if emitted via UCI info
+            used_eng = self.target_engine if role == "target" else self.opponent_engine
+            proto = getattr(used_eng, "protocol", None)
+            raw_cp = getattr(proto, "latest_score_cp", None)
+            search_white_cp = None
+            if raw_cp is not None:
+                search_white_cp = int(raw_cp) if mover_is_white else -int(raw_cp)
+                if ply_records and ply_records[-1].get("eval_after_cp") is None:
+                    ply_records[-1]["eval_after_cp"] = search_white_cp
+
             is_castling = self.board.is_castling(result.move)
             is_promotion = result.move.promotion is not None
             try:
                 san = self.board.san(result.move)
             except Exception:
                 san = result.move.uci()
+            uci_str = result.move.uci()
             self.board.push(result.move)
+            fen_after = self.board.fen()
             is_check = self.board.is_check()
             self._emit_sound(self._classify_move_sound(
                 is_check=is_check,
@@ -2050,13 +2493,35 @@ class TournamentWorker(threading.Thread):
             ))
             self.current_move_number += 1
             self.last_move_san = san
-            self.last_move_uci = result.move.uci()
+            self.last_move_uci = uci_str
             self.total_move_counter += 1
             self.recent_moves.append(san)
             if len(self.recent_moves) > 12:
                 self.recent_moves = self.recent_moves[-12:]
-            self.current_fen_shared = self.board.fen()
+            self.current_fen_shared = fen_after
+
+            ply_records.append({
+                "ply":            self.current_move_number,
+                "uci":            uci_str,
+                "san":            san,
+                "mover_is_white": mover_is_white,
+                "fen_before":     fen_before,
+                "fen_after":      fen_after,
+                "move_time":      round(dt, 4),
+                "white_left":     round(self.white_clock, 3),
+                "black_left":     round(self.black_clock, 3),
+                "eval_before_cp": search_white_cp if search_white_cp is not None else prev_search_white_cp,
+                "eval_after_cp":  None,
+                "mate_after":     None,
+            })
+            prev_search_white_cp = search_white_cp
+
         outcome = self.board.outcome()
+        if outcome is None:
+            if self.board.is_fifty_moves():
+                outcome = chess.Outcome(chess.Termination.FIFTY_MOVES, None)
+            elif self.board.is_repetition(3):
+                outcome = chess.Outcome(chess.Termination.THREEFOLD_REPETITION, None)
         try:
             self.last_game_was_checkmate = (
                 outcome is not None
@@ -2064,55 +2529,40 @@ class TournamentWorker(threading.Thread):
                 and outcome.termination == chess.Termination.CHECKMATE)
         except Exception:
             self.last_game_was_checkmate = False
-        if outcome is None:
-            if not self.running:
-                raise TournamentAborted()
-            info = self._safe_analyse(self.board)
-            if not self.running:
-                raise TournamentAborted()
-            white_wins = None
-            if info is not None:
-                try:
-                    eval_score = info["score"].white().score(mate_score=10000)
-                    if eval_score is None:
-                        eval_score = 0
-                    if eval_score > 200:
-                        white_wins = True
-                    elif eval_score < -200:
-                        white_wins = False
-                except Exception:
-                    pass
-            if white_wins is None:
-                self.last_game_result = "Draw (adjudicated)"
-                self._emit_sound("game-end")
-                return "D"
-            if white_wins == target_is_white:
-                self.last_game_result = "Target wins (adjudicated)"
-                self._emit_sound("game-end")
-                return "W"
-            self.last_game_result = "Opponent wins (adjudicated)"
-            self._emit_sound("game-end")
-            return "L"
-        if outcome.winner is None:
-            self.last_game_result = f"Draw ({outcome.termination.name})"
+
+        term_name = outcome.termination.name if (outcome and outcome.termination) else "DRAW"
+        if outcome is None or outcome.winner is None:
+            self.last_game_result = f"Draw ({term_name})"
+            if hasattr(self, "_finalize_game_record"):
+                self._finalize_game_record(
+                    "D", "1/2-1/2", term_name,
+                    target_is_white, initial_fen, self.current_opening_name, ply_records,
+                )
             self._emit_sound("game-end")
             return "D"
         if outcome.winner == chess.WHITE:
-            if target_is_white:
-                self.last_game_result = "Target wins (1-0)"
-                self._emit_sound("game-end")
-                return "W"
-            self.last_game_result = "Opponent wins (1-0)"
+            res_code = "W" if target_is_white else "L"
+            self.last_game_result = (
+                "Target wins (1-0)" if target_is_white else "Opponent wins (1-0)"
+            )
+            if hasattr(self, "_finalize_game_record"):
+                self._finalize_game_record(
+                    res_code, "1-0", term_name,
+                    target_is_white, initial_fen, self.current_opening_name, ply_records,
+                )
             self._emit_sound("game-end")
-            return "L"
-        else:
-            if target_is_white:
-                self.last_game_result = "Opponent wins (0-1)"
-                self._emit_sound("game-end")
-                return "L"
-            self.last_game_result = "Target wins (0-1)"
-            self._emit_sound("game-end")
-            return "W"
+            return res_code
+        res_code = "L" if target_is_white else "W"
+        self.last_game_result = (
+            "Opponent wins (0-1)" if target_is_white else "Target wins (0-1)"
+        )
+        if hasattr(self, "_finalize_game_record"):
+            self._finalize_game_record(
+                res_code, "0-1", term_name,
+                target_is_white, initial_fen, self.current_opening_name, ply_records,
+            )
+        self._emit_sound("game-end")
+        return res_code
 
 # ----------------------------------------------------------------------
 # MAIN APPLICATION
@@ -2230,6 +2680,56 @@ class EloifyApp:
         self._last_browse_click_time = 0.0
         self._last_browse_click_idx = -1
 
+        # ---- Feature settings: board, piece style, theme, audio, tracking ----
+        self.cfg_auto_rotate_board    = False
+        self.cfg_hide_coords          = False
+        self.cfg_engine_data_tracking = False
+        self.cfg_move_quality_elo     = True
+
+        self.theme_mode = "dark"
+        self.accent_key = "emerald"
+        self.board_skin = "classic_wood"
+        self.custom_light_sq = [238, 216, 183]
+        self.custom_dark_sq  = [171, 122, 89]
+        self.piece_style     = "classic_2tone"
+
+        self.audio_muted  = False
+        self.audio_volume = 1.0
+        self.dragging_audio_volume = False
+        self.dragging_rgb_slider   = None
+        self.settings_tab          = 0  # 0=Engine & Rules, 1=Board & Pieces, 2=Theme & Accents
+
+        # ---- Engine playlist ("Next in line") ----
+        self.engine_playlist       = []
+        self.playlist_scroll       = 0
+        self.browse_mode           = "primary"
+        self.active_playlist_paths = []
+        self.playlist_current_idx  = 0
+        self.playlist_results      = []
+        self.selected_result_idx   = 0
+
+        # ---- Live & post-test UI state ----
+        self.running_opp_scroll    = 0
+        self.running_opp_autoscroll = True
+        self.confirm_back_to_menu  = False
+        self.done_scroll_y         = 0
+        self.done_max_scroll       = 0
+        self._done_game_hitboxes   = []
+        self._done_playlist_hitboxes = []
+        self._running_skip_hitboxes = []
+        self._playlist_row_hitboxes = []
+
+        # ---- Live Eval Worker & Replay Viewer state ----
+        self.shared_eval_cache   = {}
+        self.live_eval_worker    = None
+        self.replay_eval_worker  = None
+        self._displayed_eval_frac = 0.5
+        self.replay_game         = None
+        self.replay_ply          = 0
+        self.replay_flipped      = None
+        self.replay_moves_scroll = 0
+        self._replay_move_hitboxes = []
+
         # ---- Main menu animation state ----
         self._menu_time = 0.0
         self._menu_bg_gradient = self._make_menu_bg_gradient()
@@ -2237,28 +2737,192 @@ class EloifyApp:
         self._menu_particles = []
         self._init_menu_particles()
 
-        # Buttons (main menu — large, primary action on the right)
-        self.browse_rect = pygame.Rect(60, 505, 420, 70)
-        self.start_rect  = pygame.Rect(520, 505, 420, 70)
-        self.edit_system_rect = pygame.Rect(400, 186, 60, 26)
+        # Buttons (main menu)
+        self.browse_rect      = pygame.Rect(50, 672, 340, 62)
+        self.customize_rect   = pygame.Rect(410, 672, 340, 62)
+        self.start_rect       = pygame.Rect(770, 672, 420, 62)
+        self.edit_system_rect = pygame.Rect(422, 184, 62, 26)
+        self.quick_theme_rect = pygame.Rect(WINDOW_WIDTH - 196, 44, 146, 34)
+        self.playlist_add_rect   = pygame.Rect(988, 182, 108, 28)
+        self.playlist_clear_rect = pygame.Rect(1104, 182, 68, 28)
 
         # Settings dialog buttons
-        self.settings_reset_rect  = pygame.Rect(130, 600, 160, 44)
-        self.settings_cancel_rect = pygame.Rect(630, 600, 110, 44)
-        self.settings_save_rect   = pygame.Rect(760, 600, 110, 44)
+        sp = self._get_settings_panel_rect()
+        self.settings_reset_rect  = pygame.Rect(sp.x + 28, sp.bottom - 58, 160, 42)
+        self.settings_cancel_rect = pygame.Rect(sp.right - 258, sp.bottom - 58, 110, 42)
+        self.settings_save_rect   = pygame.Rect(sp.right - 136, sp.bottom - 58, 110, 42)
+
+        # Live / Done top-bar controls
+        self.running_back_rect = pygame.Rect(20, 18, 112, 34)
+        self.running_mute_rect = pygame.Rect(WINDOW_WIDTH - 246, 18, 76, 32)
+        self.running_vol_rect  = pygame.Rect(WINDOW_WIDTH - 158, 29, 134, 10)
+        self.done_back_rect    = pygame.Rect(24, 12, 132, 34)
+        self.replay_back_rect  = pygame.Rect(24, 14, 152, 34)
+        self.replay_flip_rect  = pygame.Rect(188, 14, 118, 34)
 
         self.mouse_pos = (0, 0)
+        self._sync_board_visuals()
+        self._apply_audio_volume()
+
+    # ------------------------------------------------------------------
+    # THEME, BOARD VISUALS, AND AUDIO HELPERS
+    # ------------------------------------------------------------------
+    def _current_palette(self):
+        return ef.get_theme_palette(
+            getattr(self, "theme_mode", "dark"),
+            getattr(self, "accent_key", "emerald"),
+        )
+
+    def _apply_theme(self, mode=None, accent_key=None):
+        global BACKGROUND, PANEL, PANEL_HOVER, BORDER, TEXT_COLOR, DIM_TEXT
+        global ACCENT, GOLD, ERROR_COLOR, WIN_COLOR, LOSS_COLOR, DRAW_COLOR
+        global SELECTION_BG, FIELD_BG, FIELD_BORDER, LIST_BG, LIST_ROW_HOVER, LIST_ROW_SEL
+        if mode is not None:
+            self.theme_mode = mode
+        if accent_key is not None:
+            self.accent_key = accent_key
+        pal = self._current_palette()
+        BACKGROUND     = pal["BACKGROUND"]
+        PANEL          = pal["PANEL"]
+        PANEL_HOVER    = pal["PANEL_HOVER"]
+        BORDER         = pal["BORDER"]
+        TEXT_COLOR     = pal["TEXT_COLOR"]
+        DIM_TEXT       = pal["DIM_TEXT"]
+        ACCENT         = pal["ACCENT"]
+        GOLD           = pal["GOLD"]
+        ERROR_COLOR    = pal["ERROR_COLOR"]
+        WIN_COLOR      = pal["WIN_COLOR"]
+        LOSS_COLOR     = pal["LOSS_COLOR"]
+        DRAW_COLOR     = pal["DRAW_COLOR"]
+        SELECTION_BG   = pal["SELECTION_BG"]
+        FIELD_BG       = pal["FIELD_BG"]
+        FIELD_BORDER   = pal["FIELD_BORDER"]
+        LIST_BG        = pal["LIST_BG"]
+        LIST_ROW_HOVER = pal["LIST_ROW_HOVER"]
+        LIST_ROW_SEL   = pal["LIST_ROW_SEL"]
+        _TEXT_CACHE.clear()
+        _PIECE_SURFACE_CACHE.clear()
+        self._menu_bg_gradient = self._make_menu_bg_gradient()
+        self._menu_title_glow = None
+        self._elo_surface_cache = None
+
+    def _sync_board_visuals(self):
+        global _ACTIVE_BOARD_LIGHT, _ACTIVE_BOARD_DARK, _ACTIVE_PIECE_STYLE, _ACTIVE_SHOW_COORDS
+        light_c, dark_c = ef.resolve_board_colors(
+            getattr(self, "board_skin", "classic_wood"),
+            getattr(self, "custom_light_sq", (238, 216, 183)),
+            getattr(self, "custom_dark_sq", (171, 122, 89)),
+        )
+        _ACTIVE_BOARD_LIGHT = light_c
+        _ACTIVE_BOARD_DARK  = dark_c
+        _ACTIVE_PIECE_STYLE = getattr(self, "piece_style", "classic_2tone")
+        _ACTIVE_SHOW_COORDS = not getattr(self, "cfg_hide_coords", False)
+
+    def _apply_audio_volume(self):
+        muted = getattr(self, "audio_muted", False)
+        vol = 0.0 if muted else max(0.0, min(1.0, float(getattr(self, "audio_volume", 1.0))))
+        for snd in (
+            getattr(self, "drumroll_sound", None),
+            getattr(self, "celebration_sound", None),
+            *(getattr(self, "sounds", {}) or {}).values(),
+        ):
+            if snd is not None:
+                try:
+                    snd.set_volume(vol)
+                except Exception:
+                    pass
+        for ch in (getattr(self, "sound_channels", {}) or {}).values():
+            if ch is not None:
+                try:
+                    ch.set_volume(vol)
+                except Exception:
+                    pass
+
+    def _draw_audio_controls(self, mute_rect, vol_rect):
+        muted = getattr(self, "audio_muted", False)
+        vol = max(0.0, min(1.0, float(getattr(self, "audio_volume", 1.0))))
+        eff = 0.0 if muted else vol
+        hov = mute_rect.collidepoint(self.mouse_pos)
+        fill = PANEL_HOVER if hov else PANEL
+        bdr = ERROR_COLOR if muted else (ACCENT if hov else BORDER)
+        pygame.draw.rect(self.screen, fill, mute_rect, border_radius=7)
+        pygame.draw.rect(self.screen, bdr, mute_rect, width=1, border_radius=7)
+        lbl = "Muted" if muted else "Mute"
+        col = ERROR_COLOR if muted else TEXT_COLOR
+        s = _render_text(lbl, 13, col, True)
+        self.screen.blit(s, s.get_rect(center=mute_rect.center))
+
+        track_bg = (52, 58, 72) if getattr(self, "theme_mode", "dark") == "dark" else (204, 212, 226)
+        pygame.draw.rect(self.screen, track_bg, vol_rect, border_radius=5)
+        fill_w = int(round(vol_rect.w * eff))
+        if fill_w > 0:
+            pygame.draw.rect(
+                self.screen,
+                ACCENT,
+                pygame.Rect(vol_rect.x, vol_rect.y, max(4, fill_w), vol_rect.h),
+                border_radius=5,
+            )
+        knob_x = vol_rect.x + int(round(vol_rect.w * eff))
+        pygame.draw.circle(self.screen, ACCENT if not muted else DIM_TEXT,
+                           (knob_x, vol_rect.centery), 7)
+        pygame.draw.circle(self.screen, BACKGROUND, (knob_x, vol_rect.centery), 3)
+        pct_txt = f"{int(round(eff * 100))}%"
+        draw_text(self.screen, pct_txt, (vol_rect.x + vol_rect.w // 2 - 14, vol_rect.bottom + 3),
+                  11, DIM_TEXT)
+
+    def _set_volume_from_mouse(self, vol_rect, mx):
+        frac = max(0.0, min(1.0, (mx - vol_rect.x) / max(1, vol_rect.w)))
+        self.audio_volume = round(frac, 3)
+        if self.audio_volume > 0.0 and self.audio_muted:
+            self.audio_muted = False
+        self._apply_audio_volume()
+
+    def _accept_browsed_engine(self, path):
+        mode = getattr(self, "browse_mode", "primary")
+        if mode == "playlist_add":
+            self.engine_playlist.append(path)
+            if not self.target_path:
+                self.target_path = path
+            self.status_text = (
+                f"Added to playlist ({len(self.engine_playlist)} queued): "
+                f"{os.path.basename(path)}"
+            )
+        else:
+            self.target_path = path
+            if not self.engine_playlist:
+                self.engine_playlist = [path]
+            else:
+                self.engine_playlist[0] = path
+            self.status_text = f"Selected: {os.path.basename(path)}"
+        self.browse_mode = "primary"
+
+    def _stop_aux_workers(self):
+        for attr in ("live_eval_worker", "replay_eval_worker"):
+            ew = getattr(self, attr, None)
+            if ew is not None:
+                try:
+                    ew.stop()
+                    ew.join(timeout=0.8)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     # ------------------------------------------------------------------
     # MAIN MENU — decorative helpers
     # ------------------------------------------------------------------
     def _make_menu_bg_gradient(self):
         surf = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+        is_light = sum(BACKGROUND) > 400
         for y in range(WINDOW_HEIGHT):
             t = y / max(1, WINDOW_HEIGHT - 1)
-            r = int(BACKGROUND[0] * (0.85 + 0.35 * t))
-            g = int(BACKGROUND[1] * (0.85 + 0.30 * t))
-            b = int(BACKGROUND[2] * (0.85 + 0.20 * t))
+            if is_light:
+                r = max(0, min(255, int(BACKGROUND[0] - 12 * t)))
+                g = max(0, min(255, int(BACKGROUND[1] - 10 * t)))
+                b = max(0, min(255, int(BACKGROUND[2] - 6 * t)))
+            else:
+                r = max(0, min(255, int(BACKGROUND[0] * (0.85 + 0.35 * t))))
+                g = max(0, min(255, int(BACKGROUND[1] * (0.85 + 0.30 * t))))
+                b = max(0, min(255, int(BACKGROUND[2] * (0.85 + 0.20 * t))))
             pygame.draw.line(surf, (r, g, b), (0, y), (WINDOW_WIDTH, y))
         return surf
 
@@ -2325,81 +2989,130 @@ class EloifyApp:
 
     def _draw_menu_button(self, rect, label, enabled=True, primary=False):
         hovered = enabled and rect.collidepoint(self.mouse_pos)
+        is_light = sum(BACKGROUND) > 400
         if not enabled:
-            fill, border, text_color = (42, 46, 56), (60, 64, 76), (120, 125, 135)
+            fill = (212, 218, 228) if is_light else (42, 46, 56)
+            border = (188, 196, 210) if is_light else (60, 64, 76)
+            text_color = (140, 148, 162) if is_light else (120, 125, 135)
         elif primary:
             pulse = 0.5 + 0.5 * math.sin(self._menu_time * 3.5)
-            base = (78, 200, 148)
-            bright = (105, 225, 172)
-            mix = 0.55 + 0.45 * pulse
-            fill = (
-                int(base[0] + (bright[0] - base[0]) * mix),
-                int(base[1] + (bright[1] - base[1]) * mix),
-                int(base[2] + (bright[2] - base[2]) * mix),
-            )
+            mix = 0.86 + 0.14 * pulse
+            fill = tuple(max(0, min(255, int(c * mix))) for c in ACCENT)
             if hovered:
-                fill = (int(fill[0] * 1.08), int(fill[1] * 1.08), int(fill[2] * 1.08))
-            border = (140, 245, 195)
-            text_color = (12, 24, 18)
+                fill = tuple(max(0, min(255, int(c * 1.08 + 8))) for c in fill)
+            border = tuple(max(0, min(255, c + 35)) for c in ACCENT)
+            lum = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
+            text_color = (14, 20, 26) if lum > 145 else (248, 250, 252)
         elif hovered:
             fill, border, text_color = PANEL_HOVER, ACCENT, TEXT_COLOR
         else:
             fill, border, text_color = PANEL, BORDER, TEXT_COLOR
-        pygame.draw.rect(self.screen, (12, 14, 18),
+        shadow_col = (185, 192, 206) if is_light else (12, 14, 18)
+        pygame.draw.rect(self.screen, shadow_col,
                          pygame.Rect(rect.x, rect.y + 3, rect.width, rect.height),
                          border_radius=12)
         if primary and enabled:
-            glow_rect = rect.inflate(20, 20)
+            glow_rect = rect.inflate(16, 16)
             glow_surf = pygame.Surface((glow_rect.width, glow_rect.height),
                                        pygame.SRCALPHA)
-            glow_alpha = 55 + int(35 * (0.5 + 0.5 * math.sin(self._menu_time * 3.5)))
+            glow_alpha = 40 + int(30 * (0.5 + 0.5 * math.sin(self._menu_time * 3.5)))
             pygame.draw.rect(glow_surf, (*ACCENT, glow_alpha),
-                             glow_surf.get_rect(), border_radius=20)
+                             glow_surf.get_rect(), border_radius=18)
             self.screen.blit(glow_surf, glow_rect)
         pygame.draw.rect(self.screen, fill, rect, border_radius=12)
         pygame.draw.rect(self.screen, border, rect, width=2, border_radius=12)
-        surf = _render_text(label, 22, text_color, True)
+        surf = _render_text(label, 20, text_color, True)
         self.screen.blit(surf, surf.get_rect(center=rect.center))
 
-    def _draw_edit_button(self, rect):
+    def _draw_edit_button(self, rect, label="Edit"):
         hovered = rect.collidepoint(self.mouse_pos)
         if hovered:
-            fill = (48, 68, 58)
+            fill = PANEL_HOVER
             border = ACCENT
             text_color = TEXT_COLOR
         else:
-            fill = (44, 50, 60)
+            fill = PANEL
             border = BORDER
             text_color = DIM_TEXT
         pygame.draw.rect(self.screen, fill, rect, border_radius=6)
         pygame.draw.rect(self.screen, border, rect, width=1, border_radius=6)
-        surf = _render_text("Edit", 13, text_color, True)
+        surf = _render_text(label, 13, text_color, True)
         self.screen.blit(surf, surf.get_rect(center=rect.center))
 
-    def _draw_stat_panel(self, rect, title, rows, accent=ACCENT):
+    def _draw_stat_panel(self, rect, title, rows, accent=None):
+        accent = accent or ACCENT
         pygame.draw.rect(self.screen, PANEL, rect, border_radius=12)
         pygame.draw.rect(self.screen, BORDER, rect, width=1, border_radius=12)
-        draw_text(self.screen, title, (rect.x + 20, rect.y + 16), 14, accent, bold=True)
+        draw_text(self.screen, title, (rect.x + 20, rect.y + 14), 14, accent, bold=True)
         pygame.draw.line(self.screen, BORDER,
-                         (rect.x + 20, rect.y + 40),
-                         (rect.right - 20, rect.y + 40), 1)
+                         (rect.x + 20, rect.y + 38),
+                         (rect.right - 20, rect.y + 38), 1)
         for i, (label, value, color) in enumerate(rows):
-            ry = rect.y + 58 + i * 26
-            draw_text(self.screen, label, (rect.x + 20, ry), 15, DIM_TEXT)
-            vsurf = _render_text(str(value), 15, color or TEXT_COLOR, True)
+            ry = rect.y + 50 + i * 24
+            draw_text(self.screen, label, (rect.x + 20, ry), 14, DIM_TEXT)
+            vsurf = _render_text(str(value), 14, color or TEXT_COLOR, True)
             self.screen.blit(vsurf, (rect.right - 20 - vsurf.get_width(), ry))
 
     # ------------------------------------------------------------------
-    # SETTINGS DIALOG
+    # SETTINGS & CUSTOMIZATION DIALOG (3 TABS)
     # ------------------------------------------------------------------
+    def _get_settings_panel_rect(self):
+        return pygame.Rect((WINDOW_WIDTH - 960) // 2, (WINDOW_HEIGHT - 650) // 2, 960, 650)
+
+    def _get_settings_tab_rects(self):
+        panel = self._get_settings_panel_rect()
+        labels = ("Engine & Rules", "Board & Pieces", "Theme & Accents")
+        rects = []
+        tx = panel.x + 30
+        for lbl in labels:
+            rects.append((pygame.Rect(tx, panel.y + 58, 190, 34), lbl))
+            tx += 200
+        return rects
+
     def _get_slider_rects(self):
-        panel = pygame.Rect(100, 60, 800, 620)
+        panel = self._get_settings_panel_rect()
         tracks = []
         for i in range(len(SLIDER_CONFIGS)):
-            row_y = panel.y + 100 + i * 100
-            track = pygame.Rect(panel.x + 30, row_y + 38, panel.w - 60, 6)
+            row_y = panel.y + 118 + i * 96
+            track = pygame.Rect(panel.x + 30, row_y + 36, 430, 6)
             tracks.append((track, row_y))
         return panel, tracks
+
+    def _get_gameplay_toggle_rects(self):
+        panel = self._get_settings_panel_rect()
+        items = [
+            ("cfg_auto_rotate_board", "Auto-rotate board",
+             "View games from the target engine's perspective"),
+            ("cfg_hide_coords", "Hide board coordinates",
+             "Hide rank (1–8) and file (a–h) labels on squares"),
+            ("cfg_engine_data_tracking", "Engine Data tracking",
+             "Track CPU %, RAM usage (MB), threads & NPS each game"),
+            ("cfg_move_quality_elo", "Per-game Move-Quality Elo",
+             "Rate Elo per game based on move accuracy & ACPL"),
+        ]
+        out = []
+        rx = panel.x + 500
+        for i, (attr, title, desc) in enumerate(items):
+            r = pygame.Rect(rx, panel.y + 118 + i * 92, 430, 76)
+            out.append((r, attr, title, desc))
+        return out
+
+    def _get_rgb_slider_rects(self):
+        panel = self._get_settings_panel_rect()
+        labels = [
+            ("light", 0, "Light Square — Red"),
+            ("light", 1, "Light Square — Green"),
+            ("light", 2, "Light Square — Blue"),
+            ("dark",  0, "Dark Square — Red"),
+            ("dark",  1, "Dark Square — Green"),
+            ("dark",  2, "Dark Square — Blue"),
+        ]
+        out = []
+        for i, (which, ch_idx, lbl) in enumerate(labels):
+            ry = panel.y + 220 + i * 44
+            tr = pygame.Rect(panel.x + 30, ry + 22, 330, 6)
+            out.append((tr, ry, which, ch_idx, lbl))
+        return out
 
     def _slider_params(self, key):
         for entry in SLIDER_CONFIGS:
@@ -2456,58 +3169,148 @@ class EloifyApp:
             value = max(vmin, min(vmax, value))
         setattr(self, f"cfg_{key}", value)
 
-    def _draw_settings_button(self, rect, label, primary=False):
+    def _update_rgb_slider_from_mouse(self, idx, mx):
+        sliders = self._get_rgb_slider_rects()
+        tr, _, which, ch_idx, _ = sliders[idx]
+        frac = max(0.0, min(1.0, (mx - tr.x) / max(1, tr.w)))
+        val = max(0, min(255, int(round(frac * 255))))
+        if self.board_skin != "custom":
+            l_cur, d_cur = ef.resolve_board_colors(
+                self.board_skin, self.custom_light_sq, self.custom_dark_sq
+            )
+            self.custom_light_sq = list(l_cur)
+            self.custom_dark_sq = list(d_cur)
+            self.board_skin = "custom"
+        if which == "light":
+            self.custom_light_sq[ch_idx] = val
+        else:
+            self.custom_dark_sq[ch_idx] = val
+        self._sync_board_visuals()
+
+    def _draw_settings_button(self, rect, label, primary=False, active=False):
         hovered = rect.collidepoint(self.mouse_pos)
+        is_light = sum(BACKGROUND) > 400
         if primary:
-            fill = (105, 225, 172) if hovered else (78, 200, 148)
-            border = (140, 245, 195)
-            text_color = (12, 24, 18)
+            fill = tuple(max(0, min(255, int(c * (1.08 if hovered else 0.96)))) for c in ACCENT)
+            border = tuple(max(0, min(255, c + 30)) for c in ACCENT)
+            lum = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
+            text_color = (14, 20, 26) if lum > 145 else (248, 250, 252)
+        elif active:
+            fill = LIST_ROW_SEL
+            border = ACCENT
+            text_color = TEXT_COLOR
         elif hovered:
             fill = PANEL_HOVER
             border = ACCENT
             text_color = TEXT_COLOR
         else:
-            fill = (44, 50, 60)
+            fill = (232, 237, 245) if is_light else (44, 50, 60)
             border = BORDER
             text_color = TEXT_COLOR
-        pygame.draw.rect(self.screen, (12, 14, 18),
-                         pygame.Rect(rect.x, rect.y + 2, rect.w, rect.h),
-                         border_radius=8)
         pygame.draw.rect(self.screen, fill, rect, border_radius=8)
-        pygame.draw.rect(self.screen, border, rect, width=2, border_radius=8)
-        surf = _render_text(label, 16, text_color, True)
+        pygame.draw.rect(self.screen, border, rect, width=2 if (primary or active) else 1, border_radius=8)
+        surf = _render_text(label, 14, text_color, True)
         self.screen.blit(surf, surf.get_rect(center=rect.center))
 
-    def open_settings(self):
+    def open_settings(self, tab=0):
+        self.settings_tab = tab
         self.settings_snapshot = {
-            "cpu_cores": self.cfg_cpu_cores,
-            "threads":   self.cfg_threads,
-            "hash":      self.cfg_hash,
-            "time":      self.cfg_time,
+            "cpu_cores":             self.cfg_cpu_cores,
+            "threads":               self.cfg_threads,
+            "hash":                  self.cfg_hash,
+            "time":                  self.cfg_time,
+            "cfg_auto_rotate_board": self.cfg_auto_rotate_board,
+            "cfg_hide_coords":       self.cfg_hide_coords,
+            "cfg_engine_data_tracking": self.cfg_engine_data_tracking,
+            "cfg_move_quality_elo":  self.cfg_move_quality_elo,
+            "theme_mode":            self.theme_mode,
+            "accent_key":            self.accent_key,
+            "board_skin":            self.board_skin,
+            "custom_light_sq":       list(self.custom_light_sq),
+            "custom_dark_sq":        list(self.custom_dark_sq),
+            "piece_style":           self.piece_style,
         }
         self.dragging_slider = None
+        self.dragging_rgb_slider = None
         self.state = "EDIT_SETTINGS"
 
     def settings_save(self):
+        self._sync_board_visuals()
+        self._apply_theme(self.theme_mode, self.accent_key)
         self.settings_snapshot = None
         self.dragging_slider = None
+        self.dragging_rgb_slider = None
         self.state = "MENU"
 
     def settings_cancel(self):
-        if self.settings_snapshot:
-            self.cfg_cpu_cores = self.settings_snapshot["cpu_cores"]
-            self.cfg_threads   = self.settings_snapshot["threads"]
-            self.cfg_hash      = self.settings_snapshot["hash"]
-            self.cfg_time      = self.settings_snapshot["time"]
+        snap = self.settings_snapshot
+        if snap:
+            self.cfg_cpu_cores            = snap["cpu_cores"]
+            self.cfg_threads              = snap["threads"]
+            self.cfg_hash                 = snap["hash"]
+            self.cfg_time                 = snap["time"]
+            self.cfg_auto_rotate_board    = snap["cfg_auto_rotate_board"]
+            self.cfg_hide_coords          = snap["cfg_hide_coords"]
+            self.cfg_engine_data_tracking = snap["cfg_engine_data_tracking"]
+            self.cfg_move_quality_elo     = snap["cfg_move_quality_elo"]
+            self.board_skin               = snap["board_skin"]
+            self.custom_light_sq          = list(snap["custom_light_sq"])
+            self.custom_dark_sq           = list(snap["custom_dark_sq"])
+            self.piece_style              = snap["piece_style"]
+            self._sync_board_visuals()
+            self._apply_theme(snap["theme_mode"], snap["accent_key"])
         self.settings_snapshot = None
         self.dragging_slider = None
+        self.dragging_rgb_slider = None
         self.state = "MENU"
 
     def settings_reset(self):
-        self.cfg_cpu_cores = self._actual_cpu
-        self.cfg_threads   = get_recommended_threads(cpu_cores=self._actual_cpu)
-        self.cfg_hash      = get_recommended_hash_mb()
-        self.cfg_time      = TIME_LIMIT
+        self.cfg_cpu_cores            = self._actual_cpu
+        self.cfg_threads              = get_recommended_threads(cpu_cores=self._actual_cpu)
+        self.cfg_hash                 = get_recommended_hash_mb()
+        self.cfg_time                 = TIME_LIMIT
+        self.cfg_auto_rotate_board    = False
+        self.cfg_hide_coords          = False
+        self.cfg_engine_data_tracking = False
+        self.cfg_move_quality_elo     = True
+        self.board_skin               = "classic_wood"
+        self.custom_light_sq          = [238, 216, 183]
+        self.custom_dark_sq           = [171, 122, 89]
+        self.piece_style              = "classic_2tone"
+        self._sync_board_visuals()
+        self._apply_theme("dark", "emerald")
+
+    def _get_board_skin_rects(self):
+        panel = self._get_settings_panel_rect()
+        rects = []
+        for idx, key in enumerate(ef.BOARD_SKIN_ORDER):
+            col = idx % 4
+            row = idx // 4
+            r = pygame.Rect(panel.x + 30 + col * 138, panel.y + 132 + row * 38, 130, 32)
+            rects.append((r, key, ef.BOARD_SKINS[key][0]))
+        return rects
+
+    def _get_piece_style_rects(self):
+        panel = self._get_settings_panel_rect()
+        rects = []
+        for idx, key in enumerate(ef.PIECE_STYLE_ORDER):
+            col = idx % 3
+            row = idx // 3
+            r = pygame.Rect(panel.x + 30 + col * 162, panel.y + 506 + row * 36, 154, 30)
+            rects.append((r, key, ef.PIECE_STYLES[key]))
+        return rects
+
+    def _get_theme_option_rects(self):
+        panel = self._get_settings_panel_rect()
+        dark_rect  = pygame.Rect(panel.x + 30, panel.y + 146, 220, 68)
+        light_rect = pygame.Rect(panel.x + 270, panel.y + 146, 220, 68)
+        accent_rects = []
+        for idx, key in enumerate(ef.ACCENT_ORDER):
+            col = idx % 3
+            row = idx // 3
+            r = pygame.Rect(panel.x + 30 + col * 210, panel.y + 276 + row * 72, 194, 58)
+            accent_rects.append((r, key, ef.ACCENT_PRESETS[key]["label"]))
+        return dark_rect, light_rect, accent_rects
 
     def _handle_settings_click(self, pos):
         if self.settings_save_rect.collidepoint(pos):
@@ -2519,18 +3322,67 @@ class EloifyApp:
         if self.settings_reset_rect.collidepoint(pos):
             self.settings_reset()
             return
-        _, tracks = self._get_slider_rects()
-        for i, (track, _) in enumerate(tracks):
-            hit = pygame.Rect(track.x - 12, track.y - 20, track.w + 24, track.h + 40)
-            if hit.collidepoint(pos):
-                self.dragging_slider = i
-                self._update_slider_from_mouse(i, pos[0])
+        for tab_idx, (trect, _) in enumerate(self._get_settings_tab_rects()):
+            if trect.collidepoint(pos):
+                self.settings_tab = tab_idx
+                self.dragging_slider = None
+                self.dragging_rgb_slider = None
                 return
+
+        if self.settings_tab == 0:
+            _, tracks = self._get_slider_rects()
+            for i, (track, _) in enumerate(tracks):
+                hit = pygame.Rect(track.x - 12, track.y - 20, track.w + 24, track.h + 40)
+                if hit.collidepoint(pos):
+                    self.dragging_slider = i
+                    self._update_slider_from_mouse(i, pos[0])
+                    return
+            for rect, attr, _, _ in self._get_gameplay_toggle_rects():
+                if rect.collidepoint(pos):
+                    setattr(self, attr, not getattr(self, attr, False))
+                    self._sync_board_visuals()
+                    return
+
+        elif self.settings_tab == 1:
+            for rect, skin_key, _ in self._get_board_skin_rects():
+                if rect.collidepoint(pos):
+                    self.board_skin = skin_key
+                    if skin_key != "custom":
+                        lc, dc = ef.resolve_board_colors(skin_key)
+                        self.custom_light_sq = list(lc)
+                        self.custom_dark_sq = list(dc)
+                    self._sync_board_visuals()
+                    return
+            for idx, (tr, _, _, _, _) in enumerate(self._get_rgb_slider_rects()):
+                hit = pygame.Rect(tr.x - 10, tr.y - 14, tr.w + 20, tr.h + 28)
+                if hit.collidepoint(pos):
+                    self.dragging_rgb_slider = idx
+                    self._update_rgb_slider_from_mouse(idx, pos[0])
+                    return
+            for rect, style_key, _ in self._get_piece_style_rects():
+                if rect.collidepoint(pos):
+                    self.piece_style = style_key
+                    self._sync_board_visuals()
+                    return
+
+        elif self.settings_tab == 2:
+            dark_rect, light_rect, accent_rects = self._get_theme_option_rects()
+            if dark_rect.collidepoint(pos):
+                self._apply_theme("dark", self.accent_key)
+                return
+            if light_rect.collidepoint(pos):
+                self._apply_theme("light", self.accent_key)
+                return
+            for rect, akey, _ in accent_rects:
+                if rect.collidepoint(pos):
+                    self._apply_theme(self.theme_mode, akey)
+                    return
 
     # ------------------------------------------------------------------
     # BROWSE ENGINE DIALOG
     # ------------------------------------------------------------------
-    def _open_browse_dialog(self):
+    def _open_browse_dialog(self, mode="primary"):
+        self.browse_mode = mode
         start_dir = None
         if self.target_path and os.path.exists(self.target_path):
             if os.path.isdir(self.target_path):
@@ -2684,8 +3536,11 @@ class EloifyApp:
             self._browse_goto(path)
             return
         if os.path.isfile(path):
-            self.target_path = path
-            self.status_text = f"Selected: {os.path.basename(path)}"
+            if hasattr(self, "_accept_browsed_engine"):
+                self._accept_browsed_engine(path)
+            else:
+                self.target_path = path
+                self.status_text = f"Selected: {os.path.basename(path)}"
             self._close_browse_dialog(success=True)
             return
         self.browse_error = f"Path not found: {path}"
@@ -2697,8 +3552,11 @@ class EloifyApp:
         if is_dir:
             self._browse_goto(full_path)
         else:
-            self.target_path = full_path
-            self.status_text = f"Selected: {os.path.basename(full_path)}"
+            if hasattr(self, "_accept_browsed_engine"):
+                self._accept_browsed_engine(full_path)
+            else:
+                self.target_path = full_path
+                self.status_text = f"Selected: {os.path.basename(full_path)}"
             self._close_browse_dialog(success=True)
 
     def _handle_browse_open(self):
@@ -2707,8 +3565,11 @@ class EloifyApp:
                 and self.browse_selected < len(self.browse_entries)):
             name, is_dir, full_path = self.browse_entries[self.browse_selected]
             if not is_dir:
-                self.target_path = full_path
-                self.status_text = f"Selected: {os.path.basename(full_path)}"
+                if hasattr(self, "_accept_browsed_engine"):
+                    self._accept_browsed_engine(full_path)
+                else:
+                    self.target_path = full_path
+                    self.status_text = f"Selected: {os.path.basename(full_path)}"
                 self._close_browse_dialog(success=True)
                 return
         # Otherwise use the text field
@@ -3186,9 +4047,32 @@ class EloifyApp:
             self.draw()
             self.clock.tick(FPS)
 
+    def _get_confirm_modal_rects(self):
+        card = pygame.Rect((WINDOW_WIDTH - 460) // 2, (WINDOW_HEIGHT - 210) // 2, 460, 210)
+        cancel_r = pygame.Rect(card.right - 268, card.bottom - 56, 114, 38)
+        confirm_r = pygame.Rect(card.right - 142, card.bottom - 56, 122, 38)
+        return card, cancel_r, confirm_r
+
     def handle_key_down(self, event):
+        if getattr(self, "confirm_back_to_menu", False):
+            if event.key == pygame.K_ESCAPE:
+                self.confirm_back_to_menu = False
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.confirm_back_to_menu = False
+                self.reset()
+            return
+
         if self.state == "BROWSE_ENGINE":
             self._handle_browse_key_down(event)
+        elif self.state == "EDIT_SETTINGS":
+            if event.key == pygame.K_ESCAPE and hasattr(self, "settings_cancel"):
+                self.settings_cancel()
+        elif self.state == "RUNNING":
+            if event.key == pygame.K_ESCAPE:
+                self.confirm_back_to_menu = True
+            elif event.key == pygame.K_m and hasattr(self, "_apply_audio_volume"):
+                self.audio_muted = not getattr(self, "audio_muted", False)
+                self._apply_audio_volume()
         elif self.state == "DONE" and self.error_text:
             command = bool(event.mod & pygame.KMOD_CTRL) or (
                 sys.platform == "darwin" and bool(event.mod & pygame.KMOD_GUI))
@@ -3197,24 +4081,55 @@ class EloifyApp:
             elif event.key == pygame.K_ESCAPE:
                 self.reset()
         elif self.state == "DONE":
+            if getattr(self, "replay_game", None) is not None:
+                plies = self.replay_game.get("plies", ())
+                cur_ply = getattr(self, "replay_ply", 0)
+                if event.key in (pygame.K_LEFT, pygame.K_a):
+                    self._set_replay_ply(max(0, cur_ply - 1))
+                elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                    self._set_replay_ply(min(len(plies), cur_ply + 1))
+                elif event.key == pygame.K_HOME:
+                    self._set_replay_ply(0)
+                elif event.key == pygame.K_END:
+                    self._set_replay_ply(len(plies))
+                elif event.key == pygame.K_f:
+                    self.replay_flipped = not bool(self._effective_replay_flipped())
+                elif event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                    self._close_replay_game()
+                return
+
+            if event.key == pygame.K_ESCAPE and hasattr(self, "_get_confirm_modal_rects"):
+                self.confirm_back_to_menu = True
+                return
+
             w = getattr(self, "worker", None)
-            rows = [r for r in getattr(w, "per_opponent_results", ())
-                    if r[2] + r[3] + r[4] > 0]
+            rows = (self._active_done_opponent_rows()
+                    if hasattr(self, "_active_done_opponent_rows")
+                    else [r for r in getattr(w, "per_opponent_results", ())
+                          if r[2] + r[3] + r[4] > 0])
             visible = globals().get("RESULTS_VISIBLE_ROWS", 13)
             max_scroll = max(0, len(rows) - visible)
             cur = getattr(self, "results_scroll", 0)
+            d_cur = getattr(self, "done_scroll_y", 0)
+            d_max = getattr(self, "done_max_scroll", 0)
             if event.key == pygame.K_UP:
                 self.results_scroll = max(0, cur - 1)
+                self.done_scroll_y = max(0, d_cur - 44)
             elif event.key == pygame.K_DOWN:
                 self.results_scroll = min(max_scroll, cur + 1)
+                self.done_scroll_y = min(d_max, d_cur + 44)
             elif event.key == pygame.K_PAGEUP:
                 self.results_scroll = max(0, cur - visible)
+                self.done_scroll_y = max(0, d_cur - 280)
             elif event.key == pygame.K_PAGEDOWN:
                 self.results_scroll = min(max_scroll, cur + visible)
+                self.done_scroll_y = min(d_max, d_cur + 280)
             elif event.key == pygame.K_HOME:
                 self.results_scroll = 0
+                self.done_scroll_y = 0
             elif event.key == pygame.K_END:
                 self.results_scroll = max_scroll
+                self.done_scroll_y = d_max
 
     def handle_key_up(self, event):
         if self.state == "BROWSE_ENGINE":
@@ -3225,18 +4140,47 @@ class EloifyApp:
         # Do not let a stale V/C/etc. suppress the next clipboard shortcut.
         self._keys_down.clear()
         self.browse_drag_active = False
+        self.dragging_audio_volume = False
+        self.dragging_rgb_slider = None
 
     def handle_mouse_wheel(self, event):
-        if self.state == "DONE" and self.error_text:
+        if getattr(self, "confirm_back_to_menu", False):
+            return
+        if self.state == "MENU":
+            pl = getattr(self, "engine_playlist", ())
+            if len(pl) > 6:
+                cur = getattr(self, "playlist_scroll", 0) - event.y
+                self.playlist_scroll = max(0, min(cur, len(pl) - 6))
+        elif self.state == "RUNNING":
+            w = getattr(self, "worker", None)
+            entries = (w.get_schedule_snapshot()
+                       if w is not None and hasattr(w, "get_schedule_snapshot") else [])
+            vis = 11
+            max_s = max(0, len(entries) - vis)
+            self.running_opp_autoscroll = False
+            cur = getattr(self, "running_opp_scroll", 0) - event.y * 2
+            self.running_opp_scroll = max(0, min(cur, max_s))
+        elif self.state == "DONE" and self.error_text:
             self.error_scroll = max(0, self.error_scroll - event.y * 3)
         elif self.state == "DONE":
+            if getattr(self, "replay_game", None) is not None:
+                plies = self.replay_game.get("plies", ())
+                max_m = max(0, ((len(plies) + 1) // 2) - 16)
+                cur_m = getattr(self, "replay_moves_scroll", 0) - event.y * 2
+                self.replay_moves_scroll = max(0, min(cur_m, max_m))
+                return
             w = getattr(self, "worker", None)
-            rows = [r for r in getattr(w, "per_opponent_results", ())
-                    if r[2] + r[3] + r[4] > 0]
+            rows = (self._active_done_opponent_rows()
+                    if hasattr(self, "_active_done_opponent_rows")
+                    else [r for r in getattr(w, "per_opponent_results", ())
+                          if r[2] + r[3] + r[4] > 0])
             visible = globals().get("RESULTS_VISIBLE_ROWS", 13)
             max_scroll = max(0, len(rows) - visible)
             cur = getattr(self, "results_scroll", 0) - event.y * 3
             self.results_scroll = max(0, min(cur, max_scroll))
+            d_max = getattr(self, "done_max_scroll", 0)
+            d_cur = getattr(self, "done_scroll_y", 0) - event.y * 44
+            self.done_scroll_y = max(0, min(d_cur, d_max))
         elif self.state == "BROWSE_ENGINE":
             if BROWSE_LIST.collidepoint(self.mouse_pos):
                 self.browse_scroll -= event.y
@@ -3245,17 +4189,81 @@ class EloifyApp:
                 self.browse_scroll = max(0, min(self.browse_scroll, max_scroll))
 
     def handle_click(self, pos):
+        if getattr(self, "confirm_back_to_menu", False):
+            _, cancel_r, confirm_r = self._get_confirm_modal_rects()
+            if cancel_r.collidepoint(pos):
+                self.confirm_back_to_menu = False
+            elif confirm_r.collidepoint(pos):
+                self.confirm_back_to_menu = False
+                self.reset()
+            return
+
         if self.state == "MENU":
             if self.browse_rect.collidepoint(pos):
-                self._open_browse_dialog()
-            elif self.start_rect.collidepoint(pos) and self.target_path:
+                self._open_browse_dialog(mode="primary")
+            elif getattr(self, "customize_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                self.open_settings(tab=1)
+            elif getattr(self, "quick_theme_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                new_mode = "light" if getattr(self, "theme_mode", "dark") == "dark" else "dark"
+                self._apply_theme(new_mode, getattr(self, "accent_key", "emerald"))
+            elif getattr(self, "playlist_add_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                self._open_browse_dialog(mode="playlist_add")
+            elif getattr(self, "playlist_clear_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                self.engine_playlist = []
+                self.target_path = None
+                self.playlist_scroll = 0
+                self.status_text = "Playlist cleared."
+            elif self.start_rect.collidepoint(pos) and (self.target_path or getattr(self, "engine_playlist", None)):
                 self.start_tournament()
             elif self.edit_system_rect.collidepoint(pos):
-                self.open_settings()
+                self.open_settings(tab=0)
+            else:
+                for action, idx, rect in getattr(self, "_playlist_row_hitboxes", ()):
+                    if rect.collidepoint(pos) and 0 <= idx < len(self.engine_playlist):
+                        if action == "up" and idx > 0:
+                            self.engine_playlist[idx - 1], self.engine_playlist[idx] = (
+                                self.engine_playlist[idx], self.engine_playlist[idx - 1]
+                            )
+                            self.target_path = self.engine_playlist[0]
+                        elif action == "down" and idx + 1 < len(self.engine_playlist):
+                            self.engine_playlist[idx + 1], self.engine_playlist[idx] = (
+                                self.engine_playlist[idx], self.engine_playlist[idx + 1]
+                            )
+                            self.target_path = self.engine_playlist[0]
+                        elif action == "remove":
+                            self.engine_playlist.pop(idx)
+                            self.target_path = self.engine_playlist[0] if self.engine_playlist else None
+                            self.playlist_scroll = max(0, min(self.playlist_scroll, max(0, len(self.engine_playlist) - 6)))
+                        elif action == "select":
+                            self.target_path = self.engine_playlist[idx]
+                        return
         elif self.state == "EDIT_SETTINGS":
             self._handle_settings_click(pos)
         elif self.state == "BROWSE_ENGINE":
             self._handle_browse_click(pos)
+        elif self.state == "RUNNING":
+            if getattr(self, "running_back_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                self.confirm_back_to_menu = True
+                return
+            if getattr(self, "running_mute_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                self.audio_muted = not getattr(self, "audio_muted", False)
+                self._apply_audio_volume()
+                return
+            vol_r = getattr(self, "running_vol_rect", pygame.Rect(0, 0, 0, 0))
+            if vol_r.inflate(16, 22).collidepoint(pos):
+                self.dragging_audio_volume = True
+                self._set_volume_from_mouse(vol_r, pos[0])
+                return
+            w = getattr(self, "worker", None)
+            if w is not None and hasattr(w, "toggle_skip_opponent"):
+                for opp_idx, btn_rect in getattr(self, "_running_skip_hitboxes", ()):
+                    if btn_rect.collidepoint(pos):
+                        w.toggle_skip_opponent(opp_idx)
+                        return
+            follow_r = getattr(self, "_running_follow_live_rect", None)
+            if follow_r is not None and follow_r.collidepoint(pos):
+                self.running_opp_autoscroll = True
+                return
         elif self.state == "DONE":
             if self.error_text:
                 if ERROR_COPY_RECT.collidepoint(pos):
@@ -3265,13 +4273,63 @@ class EloifyApp:
                 return
             if self.done_start_time is not None:
                 elapsed = time.time() - self.done_start_time
-                if elapsed < REVEAL_DURATION + ELO_POP_DURATION:
+                if elapsed < REVEAL_DURATION:
                     return
-            self.reset()
+
+            if getattr(self, "replay_game", None) is not None:
+                if self.replay_back_rect.collidepoint(pos):
+                    self._close_replay_game()
+                    return
+                if self.replay_flip_rect.collidepoint(pos):
+                    self.replay_flipped = not bool(self._effective_replay_flipped())
+                    return
+                plies = self.replay_game.get("plies", ())
+                for action, rect in getattr(self, "_replay_nav_rects", ()):
+                    if rect.collidepoint(pos):
+                        if action == "first":
+                            self._set_replay_ply(0)
+                        elif action == "prev":
+                            self._set_replay_ply(max(0, self.replay_ply - 1))
+                        elif action == "next":
+                            self._set_replay_ply(min(len(plies), self.replay_ply + 1))
+                        elif action == "last":
+                            self._set_replay_ply(len(plies))
+                        return
+                for ply_num, rect in getattr(self, "_replay_move_hitboxes", ()):
+                    if rect.collidepoint(pos):
+                        self._set_replay_ply(ply_num)
+                        return
+                return
+
+            if getattr(self, "done_back_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                self.confirm_back_to_menu = True
+                return
+            if getattr(self, "running_mute_rect", pygame.Rect(0, 0, 0, 0)).collidepoint(pos):
+                self.audio_muted = not getattr(self, "audio_muted", False)
+                self._apply_audio_volume()
+                return
+            vol_r = getattr(self, "running_vol_rect", pygame.Rect(0, 0, 0, 0))
+            if vol_r.inflate(16, 22).collidepoint(pos):
+                self.dragging_audio_volume = True
+                self._set_volume_from_mouse(vol_r, pos[0])
+                return
+            if pos[1] >= 59:
+                for res_idx, rect in getattr(self, "_done_playlist_hitboxes", ()):
+                    if rect.collidepoint(pos):
+                        self._select_playlist_result(res_idx)
+                        return
+                for game_rec, rect in getattr(self, "_done_game_hitboxes", ()):
+                    if rect.collidepoint(pos):
+                        self._open_replay_game(game_rec)
+                        return
+            if self.estimated_elo is None and not getattr(self, "playlist_results", None):
+                self.confirm_back_to_menu = True
 
     def handle_mouse_up(self, pos):
+        self.dragging_audio_volume = False
         if self.state == "EDIT_SETTINGS":
             self.dragging_slider = None
+            self.dragging_rgb_slider = None
         elif self.state == "BROWSE_ENGINE":
             if self.browse_drag_active:
                 self.browse_drag_active = False
@@ -3280,8 +4338,14 @@ class EloifyApp:
                     field.clear_selection()
 
     def handle_mouse_motion(self, pos):
-        if self.state == "EDIT_SETTINGS" and self.dragging_slider is not None:
-            self._update_slider_from_mouse(self.dragging_slider, pos[0])
+        if getattr(self, "dragging_audio_volume", False):
+            self._set_volume_from_mouse(self.running_vol_rect, pos[0])
+            return
+        if self.state == "EDIT_SETTINGS":
+            if self.dragging_slider is not None:
+                self._update_slider_from_mouse(self.dragging_slider, pos[0])
+            elif getattr(self, "dragging_rgb_slider", None) is not None:
+                self._update_rgb_slider_from_mouse(self.dragging_rgb_slider, pos[0])
         elif self.state == "BROWSE_ENGINE" and self.browse_drag_active:
             field = self.browse_path_field
             idx = self._text_index_at(BROWSE_FIELD, field, pos[0])
@@ -3290,7 +4354,53 @@ class EloifyApp:
             if field.sel_start is None:
                 field.sel_start = idx
 
+    def _start_single_engine_worker(self, engine_path):
+        self.target_path = engine_path
+        self.progress_queue = queue.Queue()
+        self.animation = None
+        self.last_animated_fen = chess.STARTING_FEN
+        self.last_animated_counter = 0
+        self.last_move_from = None
+        self.last_move_to = None
+        self.last_games_played = 0
+        self.last_wins         = 0
+        self.last_draws        = 0
+        self.last_losses       = 0
+        self.running_opp_scroll = 0
+        self.running_opp_autoscroll = True
+        self.start_time = time.time()
+        settings = {
+            "threads":              self.cfg_threads,
+            "hash":                 self.cfg_hash,
+            "time":                 self.cfg_time,
+            "engine_data_tracking": self.cfg_engine_data_tracking,
+            "move_quality_elo":     self.cfg_move_quality_elo,
+            "chess_clock":          30.0,
+        }
+        self.worker = TournamentWorker(
+            engine_path,
+            self.progress_queue,
+            settings,
+            eval_cache=self.shared_eval_cache,
+        )
+        self.worker.start()
+
     def start_tournament(self):
+        self._stop_aux_workers()
+        paths = list(self.engine_playlist) if self.engine_playlist else (
+            [self.target_path] if self.target_path else []
+        )
+        if not paths:
+            return
+        self.active_playlist_paths = paths
+        self.playlist_current_idx = 0
+        self.playlist_results = []
+        self.selected_result_idx = 0
+        self.replay_game = None
+        self.confirm_back_to_menu = False
+        self.done_scroll_y = 0
+        self.done_max_scroll = 0
+
         self.state = "RUNNING"
         self.error_text = None
         self.error_report = ""
@@ -3299,28 +4409,154 @@ class EloifyApp:
         self.results_scroll = 0
         self._error_lines = None
         self.status_text = "Starting tournament…"
-        self.start_time = time.time()
-        self.progress_queue = queue.Queue()
-        self.animation = None
-        self.last_animated_fen = chess.STARTING_FEN
-        self.last_animated_counter = 0
-        self.last_move_from = None
-        self.last_move_to = None
         self.done_start_time = None
         self.confetti = []
         self.confetti_spawned = False
         self._elo_surface_cache = None
-        self.last_games_played = 0
-        self.last_wins         = 0
-        self.last_draws        = 0
-        self.last_losses       = 0
-        settings = {
-            "threads": self.cfg_threads,
-            "hash":    self.cfg_hash,
-            "time":    self.cfg_time,
+        self._displayed_eval_frac = 0.5
+        self.shared_eval_cache = {}
+
+        self.live_eval_worker = ef.LiveEvalWorker(
+            ADJUDICATOR_PATH, protocol_cls=CompatibleUciProtocol
+        )
+        self.live_eval_worker.cache = self.shared_eval_cache
+        self.live_eval_worker.start()
+        self._start_single_engine_worker(paths[0])
+
+    def _snapshot_finished_worker(self, estimate_payload, error_payload=None):
+        w = getattr(self, "worker", None)
+        est_kind = None
+        est_elo = None
+        ci = None
+        if estimate_payload is not None:
+            est_kind, est_elo = estimate_payload[0]
+            ci = estimate_payload[1]
+        entry = {
+            "engine_name":          getattr(w, "target_name", os.path.basename(self.target_path or "Engine")),
+            "engine_path":          getattr(w, "target_path", self.target_path),
+            "target_config_str":    getattr(w, "target_config_str", ""),
+            "estimate_kind":        est_kind,
+            "estimated_elo":        est_elo,
+            "confidence":           ci,
+            "wins":                 getattr(w, "wins", 0),
+            "draws":                getattr(w, "draws", 0),
+            "losses":               getattr(w, "losses", 0),
+            "games_played":         getattr(w, "games_played", 0),
+            "per_opponent_results": list(getattr(w, "per_opponent_results", ())),
+            "game_records":         list(getattr(w, "game_records", ())),
+            "move_quality":         getattr(w, "move_quality_summary", None),
+            "resource_summary":     getattr(w, "resource_summary", None),
+            "high_elo_extended":    getattr(w, "high_elo_extended", False),
+            "extension_start_index": getattr(w, "extension_start_index", None),
+            "error_text":           error_payload["summary"] if error_payload else None,
+            "error_report":         error_payload["report"] if error_payload else "",
         }
-        self.worker = TournamentWorker(self.target_path, self.progress_queue, settings)
-        self.worker.start()
+        self.playlist_results.append(entry)
+        return entry
+
+    def _select_playlist_result(self, idx):
+        results = getattr(self, "playlist_results", ())
+        if not (0 <= idx < len(results)):
+            return
+        self.selected_result_idx = idx
+        sel = results[idx]
+        self.estimate_kind = sel["estimate_kind"]
+        self.estimated_elo = sel["estimated_elo"]
+        self.confidence = sel["confidence"]
+        self._elo_surface_cache = None
+        rows = [r for r in sel["per_opponent_results"] if r[2] + r[3] + r[4] > 0]
+        visible = globals().get("RESULTS_VISIBLE_ROWS", 13)
+        self.results_scroll = (
+            max(0, len(rows) - visible) if sel["high_elo_extended"] else 0
+        )
+
+    def _active_done_entry(self):
+        results = getattr(self, "playlist_results", None)
+        idx = getattr(self, "selected_result_idx", 0)
+        if results and 0 <= idx < len(results):
+            return results[idx]
+        w = getattr(self, "worker", None)
+        if w is None:
+            return None
+        return {
+            "engine_name":          getattr(w, "target_name", "Target"),
+            "engine_path":          getattr(w, "target_path", self.target_path),
+            "target_config_str":    getattr(w, "target_config_str", ""),
+            "estimate_kind":        getattr(self, "estimate_kind", None),
+            "estimated_elo":        getattr(self, "estimated_elo", None),
+            "confidence":           getattr(self, "confidence", None),
+            "wins":                 getattr(w, "wins", 0),
+            "draws":                getattr(w, "draws", 0),
+            "losses":               getattr(w, "losses", 0),
+            "games_played":         getattr(w, "games_played", 0),
+            "per_opponent_results": list(getattr(w, "per_opponent_results", ())),
+            "game_records":         list(getattr(w, "game_records", ())),
+            "move_quality":         getattr(w, "move_quality_summary", None),
+            "resource_summary":     getattr(w, "resource_summary", None),
+            "high_elo_extended":    getattr(w, "high_elo_extended", False),
+            "extension_start_index": getattr(w, "extension_start_index", None),
+        }
+
+    def _active_done_opponent_rows(self):
+        entry = self._active_done_entry() if hasattr(self, "_active_done_entry") else None
+        if not entry:
+            return []
+        return [r for r in entry.get("per_opponent_results", ()) if r[2] + r[3] + r[4] > 0]
+
+    def _effective_replay_flipped(self):
+        if getattr(self, "replay_flipped", None) is not None:
+            return bool(self.replay_flipped)
+        g = getattr(self, "replay_game", None)
+        if g and getattr(self, "cfg_auto_rotate_board", False):
+            return not bool(g.get("target_is_white", True))
+        return False
+
+    def _replay_current_fen(self):
+        g = getattr(self, "replay_game", None)
+        if not g:
+            return chess.STARTING_FEN
+        plies = g.get("plies", ())
+        ply = max(0, min(int(getattr(self, "replay_ply", 0)), len(plies)))
+        if ply == 0:
+            return g.get("initial_fen", chess.STARTING_FEN)
+        return plies[ply - 1].get("fen_after", chess.STARTING_FEN)
+
+    def _set_replay_ply(self, ply_idx):
+        g = getattr(self, "replay_game", None)
+        if not g:
+            return
+        plies = g.get("plies", ())
+        self.replay_ply = max(0, min(int(ply_idx), len(plies)))
+        fen = self._replay_current_fen()
+        rew = getattr(self, "replay_eval_worker", None)
+        if rew is not None:
+            rew.request_fen(fen)
+        move_row = max(0, (self.replay_ply - 1) // 2)
+        if move_row < self.replay_moves_scroll:
+            self.replay_moves_scroll = move_row
+        elif move_row >= self.replay_moves_scroll + 14:
+            self.replay_moves_scroll = move_row - 13
+
+    def _open_replay_game(self, game_rec):
+        self.replay_game = game_rec
+        self.replay_ply = 0
+        self.replay_flipped = None
+        self.replay_moves_scroll = 0
+        if getattr(self, "replay_eval_worker", None) is None:
+            strong_threads = max(2, getattr(self, "cfg_cpu_cores", 4) // 2)
+            strong_hash = min(512, max(128, int(getattr(self, "cfg_hash", 256))))
+            self.replay_eval_worker = ef.ReplayEvalWorker(
+                ADJUDICATOR_PATH,
+                threads=strong_threads,
+                hash_mb=strong_hash,
+                protocol_cls=CompatibleUciProtocol,
+            )
+            self.replay_eval_worker.start()
+        self.replay_eval_worker.request_fen(self._replay_current_fen())
+
+    def _close_replay_game(self):
+        self.replay_game = None
+        self.replay_flipped = None
 
     def process_queue(self):
         try:
@@ -3331,12 +4567,36 @@ class EloifyApp:
                 elif msg[0] == "done":
                     if self.error_text:
                         continue  # Cleanup must not replace a fatal diagnostic.
+                    estimate = msg[1]
+                    if hasattr(self, "_snapshot_finished_worker"):
+                        self._snapshot_finished_worker(estimate)
+                        paths = getattr(self, "active_playlist_paths", ())
+                        cur_idx = getattr(self, "playlist_current_idx", 0)
+                        if cur_idx + 1 < len(paths):
+                            self.playlist_current_idx = cur_idx + 1
+                            next_path = paths[self.playlist_current_idx]
+                            self.status_text = (
+                                f"Playlist ({self.playlist_current_idx + 1}/{len(paths)}): "
+                                f"starting {os.path.basename(next_path)}…"
+                            )
+                            self._start_single_engine_worker(next_path)
+                            return
+                        if hasattr(self, "_stop_aux_workers"):
+                            self._stop_aux_workers()
+
                     self.state = "DONE"
                     self.done_start_time = time.time()
                     self.confetti = []
                     self.confetti_spawned = False
-                    estimate = msg[1]
-                    if estimate is None:
+                    self.done_scroll_y = 0
+                    if hasattr(self, "_select_playlist_result") and getattr(self, "playlist_results", None):
+                        best_idx = 0
+                        for idx_r, r_entry in enumerate(self.playlist_results):
+                            if r_entry.get("estimated_elo") is not None:
+                                best_idx = idx_r
+                                break
+                        self._select_playlist_result(best_idx)
+                    elif estimate is None:
                         self.estimated_elo = None
                         self.estimate_kind = None
                         self.confidence = None
@@ -3358,9 +4618,24 @@ class EloifyApp:
                         except Exception:
                             pass
                 elif msg[0] == "error":
+                    error = msg[1]
+                    if hasattr(self, "_snapshot_finished_worker"):
+                        paths = getattr(self, "active_playlist_paths", ())
+                        cur_idx = getattr(self, "playlist_current_idx", 0)
+                        if len(paths) > 1 and cur_idx + 1 < len(paths):
+                            self._snapshot_finished_worker(None, error_payload=error)
+                            self.playlist_current_idx = cur_idx + 1
+                            next_path = paths[self.playlist_current_idx]
+                            self.status_text = (
+                                f"Engine {cur_idx + 1} failed ({error['summary']}); "
+                                f"advancing to {os.path.basename(next_path)}…"
+                            )
+                            self._start_single_engine_worker(next_path)
+                            return
+                        if hasattr(self, "_stop_aux_workers"):
+                            self._stop_aux_workers()
                     self.state = "DONE"
                     self.estimated_elo = None
-                    error = msg[1]
                     self.error_text = error["summary"]
                     self.error_report = error["report"]
                     self.error_scroll = 0
@@ -3547,7 +4822,7 @@ class EloifyApp:
         overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 235))
         self.screen.blit(overlay, (0, 0))
-        cx, cy = WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2
+        cx, cy = WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 20
         for i in range(18):
             phase = ((elapsed * 0.5) + i * 0.4) % 1.0
             x = 80 + (i * 137) % (WINDOW_WIDTH - 160)
@@ -3559,7 +4834,7 @@ class EloifyApp:
                 qsurf.set_alpha(alpha)
                 self.screen.blit(qsurf, (int(x), int(y)))
         spinner_angle = elapsed * 5
-        radius = 150
+        radius = 135
         for i in range(12):
             a = i * math.pi / 6
             x = cx + math.cos(a) * radius
@@ -3569,30 +4844,61 @@ class EloifyApp:
             c = int(255 * brightness)
             pygame.draw.circle(self.screen, (c, int(c * 0.8), 0), (int(x), int(y)), 5)
         pulse = 0.5 + 0.5 * math.sin(elapsed * 7)
-        size = int(40 + pulse * 8)
+        size = int(38 + pulse * 6)
         dots = "." * ((int(elapsed * 3) % 4))
         msg = f"CALCULATING ELO{dots}"
         font = _get_font(_FONT_FAMILY, size, True)
         surf = font.render(msg, True, (255, 220, 100))
         self.screen.blit(surf, surf.get_rect(center=(cx, cy)))
+
+        # Progress bar for calculating Elo (0% -> 100%)
+        calc_frac = max(0.0, min(1.0, elapsed / max(0.05, REVEAL_DURATION)))
+        bar_w, bar_h = 440, 14
+        bar_rect = pygame.Rect(cx - bar_w // 2, cy + 168, bar_w, bar_h)
+        pygame.draw.rect(self.screen, (42, 48, 60), bar_rect, border_radius=7)
+        pygame.draw.rect(self.screen, (80, 90, 110), bar_rect, width=1, border_radius=7)
+        fill_w = max(8, int(round(bar_w * calc_frac))) if calc_frac > 0 else 0
+        if fill_w > 0:
+            pygame.draw.rect(
+                self.screen,
+                ACCENT,
+                pygame.Rect(bar_rect.x, bar_rect.y, fill_w, bar_h),
+                border_radius=7,
+            )
+        stage_txt = (
+            "Aggregating match outcomes…" if calc_frac < 0.35 else
+            "Fitting maximum-likelihood Elo & 95% CI…" if calc_frac < 0.72 else
+            "Finalizing per-game move-quality ratings…"
+        )
+        draw_text_centered(
+            self.screen,
+            f"{stage_txt}   ({int(round(calc_frac * 100))}%)",
+            (cx, bar_rect.bottom + 18),
+            15,
+            (210, 218, 232),
+        )
+
         glow_alpha = int(40 + 60 * pulse)
-        halo_size = int(220 + 40 * pulse)
+        halo_size = int(200 + 36 * pulse)
         halo = pygame.Surface((halo_size * 2, halo_size * 2), pygame.SRCALPHA)
         for r in range(halo_size, 0, -12):
             a = int(glow_alpha * (1 - r / halo_size))
             pygame.draw.circle(halo, (255, 200, 50, a), (halo_size, halo_size), r)
         self.screen.blit(halo, (cx - halo_size, cy - halo_size))
 
-    def _draw_elo_pop(self, cy, pop_elapsed):
-        elo_str = f"{self.estimated_elo:.0f}"
+    def _draw_elo_pop(self, cy, pop_elapsed, cx=None, target_surf=None):
+        dest = target_surf if target_surf is not None else self.screen
+        elo_val = self.estimated_elo if self.estimated_elo is not None else 0.0
+        elo_str = f"{elo_val:.0f}"
         if self.estimate_kind == "lower_bound":
             elo_str = f"≥ {elo_str}"
         elif self.estimate_kind == "upper_bound":
             elo_str = f"≤ {elo_str}"
-        cx = WINDOW_WIDTH // 2
-        cache_key = (elo_str, self.estimate_kind)
+        if cx is None:
+            cx = WINDOW_WIDTH // 2
+        cache_key = (elo_str, self.estimate_kind, GOLD)
         if self._elo_surface_cache is None or self._elo_surface_cache[0] != cache_key:
-            base_font = _get_font(_FONT_FAMILY, 64, True)
+            base_font = _get_font(_FONT_FAMILY, 60, True)
             base_surf = base_font.render(elo_str, True, GOLD)
             glow_base = base_font.render(elo_str, True, (255, 180, 60))
             self._elo_surface_cache = (cache_key, base_surf, glow_base)
@@ -3601,43 +4907,125 @@ class EloifyApp:
         pop_t = min(1.0, pop_elapsed / ELO_POP_DURATION) if pop_elapsed < ELO_POP_DURATION else 1.0
         scale = ease_out_back(pop_t, 3.0)
         if scale > 0.05:
-            halo_radius = int((bw // 2 + 90) * scale)
+            halo_radius = int((bw // 2 + 70) * scale)
             if halo_radius > 4:
                 halo = pygame.Surface((halo_radius * 2, halo_radius * 2), pygame.SRCALPHA)
                 for r in range(halo_radius, 0, -10):
-                    a = int(70 * (1 - r / halo_radius))
+                    a = int(55 * (1 - r / halo_radius))
                     pygame.draw.circle(halo, (255, 190, 40, a),
                                        (halo_radius, halo_radius), r)
-                self.screen.blit(halo, (cx - halo_radius, cy - halo_radius))
+                dest.blit(halo, (cx - halo_radius, cy - halo_radius))
         for i in range(4, 0, -1):
             gs = scale * (1.0 + i * 0.09)
             gw, gh = max(1, int(bw * gs)), max(1, int(bh * gs))
             if gw > 4 and gh > 4:
                 try:
                     glow = pygame.transform.scale(glow_base, (gw, gh))
-                    glow.set_alpha(int(45 / i))
-                    self.screen.blit(glow, glow.get_rect(center=(cx, cy)))
+                    glow.set_alpha(int(40 / i))
+                    dest.blit(glow, glow.get_rect(center=(cx, cy)))
                 except Exception:
                     pass
         tw, th = max(1, int(bw * scale)), max(1, int(bh * scale))
         if tw > 4 and th > 4:
             try:
                 scaled = pygame.transform.smoothscale(base_surf, (tw, th))
-                self.screen.blit(scaled, scaled.get_rect(center=(cx, cy)))
+                dest.blit(scaled, scaled.get_rect(center=(cx, cy)))
             except Exception:
                 pass
         label_alpha = min(255, int(255 * max(0.0, (pop_elapsed - 0.2) / 0.4)))
         if label_alpha > 0:
-            lf = _get_font(_FONT_FAMILY, 20, True)
-            label = lf.render("ESTIMATED ELO", True, DIM_TEXT)
+            lf = _get_font(_FONT_FAMILY, 17, True)
+            label = lf.render("WIN-RATE ELO", True, DIM_TEXT)
             label.set_alpha(label_alpha)
-            self.screen.blit(label, label.get_rect(center=(cx, cy - 80)))
+            dest.blit(label, label.get_rect(center=(cx, cy - 66)))
             if self.confidence is not None and self.estimate_kind == "ok":
-                cf = _get_font(_FONT_FAMILY, 18, False)
-                ci = cf.render(f"± {self.confidence:.0f}  (95% confidence)",
+                cf = _get_font(_FONT_FAMILY, 15, False)
+                ci = cf.render(f"± {self.confidence:.0f}  (95% CI)",
                                True, DIM_TEXT)
                 ci.set_alpha(label_alpha)
-                self.screen.blit(ci, ci.get_rect(center=(cx, cy + 70)))
+                dest.blit(ci, ci.get_rect(center=(cx, cy + 56)))
+
+    def _draw_eval_bar(self, rect, white_cp, mate_in=None, flipped=False, badge=None):
+        _ef = globals().get("ef")
+        target_frac = (
+            _ef.eval_bar_white_fraction(white_cp, mate_in)
+            if _ef is not None else 0.5
+        )
+        cur_frac = getattr(self, "_displayed_eval_frac", target_frac)
+        cur_frac += (target_frac - cur_frac) * 0.22
+        self._displayed_eval_frac = cur_frac
+
+        white_col = (242, 244, 248)
+        black_col = (30, 33, 42)
+        pygame.draw.rect(self.screen, black_col, rect, border_radius=5)
+        white_h = int(round(rect.h * cur_frac))
+        if flipped:
+            # White at top, Black at bottom
+            if white_h > 0:
+                pygame.draw.rect(
+                    self.screen, white_col,
+                    pygame.Rect(rect.x, rect.y, rect.w, white_h),
+                    border_radius=5,
+                )
+        else:
+            # White at bottom, Black at top
+            if white_h > 0:
+                pygame.draw.rect(
+                    self.screen, white_col,
+                    pygame.Rect(rect.x, rect.bottom - white_h, rect.w, white_h),
+                    border_radius=5,
+                )
+        mid_y = rect.centery
+        pygame.draw.line(self.screen, ACCENT, (rect.x, mid_y), (rect.right - 1, mid_y), 1)
+        pygame.draw.rect(self.screen, BORDER, rect, width=1, border_radius=5)
+
+        lbl = _ef.format_eval_label(white_cp, mate_in) if _ef is not None else "0.0"
+        draw_text_centered(self.screen, lbl, (rect.centerx, rect.y - 11), 11, TEXT_COLOR, bold=True)
+        if badge:
+            draw_text_centered(self.screen, badge, (rect.centerx, rect.bottom + 11), 10, DIM_TEXT)
+
+    def _draw_clock_pill(self, rect, seconds_left, active=False):
+        sec = max(0.0, float(seconds_left))
+        mins = int(sec) // 60
+        rem = sec - mins * 60
+        txt = f"{mins:01d}:{rem:04.1f}" if sec < 10.0 else f"{mins:02d}:{int(rem):02d}"
+        low = sec <= 5.0
+        warn = 5.0 < sec <= 10.0
+        if low:
+            fill = (110, 32, 38) if sum(BACKGROUND) < 400 else (252, 215, 218)
+            bdr = LOSS_COLOR
+            tcol = LOSS_COLOR
+        elif active:
+            fill = LIST_ROW_SEL
+            bdr = ACCENT
+            tcol = GOLD if warn else TEXT_COLOR
+        else:
+            fill = PANEL
+            bdr = BORDER
+            tcol = DIM_TEXT
+        pygame.draw.rect(self.screen, fill, rect, border_radius=7)
+        pygame.draw.rect(self.screen, bdr, rect, width=2 if active else 1, border_radius=7)
+        s = _render_text(txt, 15, tcol, True)
+        self.screen.blit(s, s.get_rect(center=rect.center))
+
+    def _draw_confirm_modal(self):
+        dim = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 185))
+        self.screen.blit(dim, (0, 0))
+        card, cancel_r, confirm_r = self._get_confirm_modal_rects()
+        draw_rounded_panel(self.screen, card, fill=PANEL, border=ACCENT, radius=14)
+        draw_text(self.screen, "Return to Main Menu?",
+                  (card.x + 26, card.y + 24), 22, TEXT_COLOR, bold=True)
+        body = (
+            "Stop the active Elo test and discard unfinished games?"
+            if self.state == "RUNNING"
+            else "Leave the Elo results screen and return to the main menu?"
+        )
+        draw_text(self.screen, body, (card.x + 26, card.y + 66), 15, DIM_TEXT)
+        draw_text(self.screen, "Press Esc to stay  ·  Enter to confirm",
+                  (card.x + 26, card.y + 94), 13, DIM_TEXT)
+        self._draw_settings_button(cancel_r, "Cancel", primary=False)
+        self._draw_settings_button(confirm_r, "Back to Menu", primary=True)
 
     def draw(self):
         if self.state == "MENU":
@@ -3661,6 +5049,8 @@ class EloifyApp:
                 self.draw_running()
             elif self.state == "DONE":
                 self.draw_done()
+        if getattr(self, "confirm_back_to_menu", False) and hasattr(self, "_draw_confirm_modal"):
+            self._draw_confirm_modal()
         pygame.display.flip()
 
     def draw_settings_overlay(self):
@@ -3672,42 +5062,145 @@ class EloifyApp:
                          pygame.Rect(panel.x, panel.y + 4, panel.w, panel.h),
                          border_radius=16)
         draw_rounded_panel(self.screen, panel, fill=PANEL, border=BORDER, radius=16)
-        draw_text(self.screen, "Settings", (panel.x + 30, panel.y + 22),
-                  28, ACCENT, bold=True)
-        draw_text(self.screen, "Adjust tournament parameters",
-                  (panel.x + 30, panel.y + 60), 15, DIM_TEXT)
+        draw_text(self.screen, "Settings & Appearance", (panel.x + 30, panel.y + 18),
+                  24, ACCENT, bold=True)
+
+        # Tabs
+        for tab_idx, (trect, tlabel) in enumerate(self._get_settings_tab_rects()):
+            self._draw_settings_button(
+                trect, tlabel, primary=False, active=(self.settings_tab == tab_idx)
+            )
         pygame.draw.line(self.screen, BORDER,
-                         (panel.x + 30, panel.y + 90),
-                         (panel.right - 30, panel.y + 90), 1)
-        warnings = self._get_setting_warnings()
-        for i, (track, row_y) in enumerate(tracks):
-            key, label, _, _, _, _ = SLIDER_CONFIGS[i]
-            value = getattr(self, f"cfg_{key}")
-            vmin, vmax, _, _ = self._slider_params(key)
-            draw_text(self.screen, label, (panel.x + 30, row_y),
-                      16, TEXT_COLOR, bold=True)
-            val_str = self._format_slider_value(key)
-            vsurf = _render_text(val_str, 18, GOLD, True)
-            self.screen.blit(vsurf, (panel.right - 30 - vsurf.get_width(), row_y - 2))
-            frac = max(0.0, min(1.0, (value - vmin) / (vmax - vmin)))
-            fill_color = warnings[key][1] if key in warnings else ACCENT
-            pygame.draw.rect(self.screen, (45, 50, 62), track, border_radius=3)
-            fill_w = int(track.w * frac)
-            if fill_w > 0:
-                pygame.draw.rect(self.screen, fill_color,
-                                 pygame.Rect(track.x, track.y, fill_w, track.h),
-                                 border_radius=3)
-            knob_x = track.x + fill_w
-            knob_y = track.centery
-            pygame.draw.circle(self.screen, (12, 14, 18), (knob_x, knob_y), 11)
-            pygame.draw.circle(self.screen, TEXT_COLOR, (knob_x, knob_y), 9)
-            pygame.draw.circle(self.screen, fill_color, (knob_x, knob_y), 9, width=2)
-            if key in warnings:
-                wtext, wcolor = warnings[key]
-                pygame.draw.circle(self.screen, wcolor,
-                                   (panel.x + 36, row_y + 60), 4)
-                draw_text(self.screen, wtext, (panel.x + 48, row_y + 52),
-                          13, wcolor)
+                         (panel.x + 30, panel.y + 100),
+                         (panel.right - 30, panel.y + 100), 1)
+
+        if self.settings_tab == 0:
+            warnings = self._get_setting_warnings()
+            for i, (track, row_y) in enumerate(tracks):
+                key, label, _, _, _, _ = SLIDER_CONFIGS[i]
+                value = getattr(self, f"cfg_{key}")
+                vmin, vmax, _, _ = self._slider_params(key)
+                draw_text(self.screen, label, (track.x, row_y),
+                          15, TEXT_COLOR, bold=True)
+                val_str = self._format_slider_value(key)
+                vsurf = _render_text(val_str, 16, GOLD, True)
+                self.screen.blit(vsurf, (track.right - vsurf.get_width(), row_y - 1))
+                frac = max(0.0, min(1.0, (value - vmin) / (vmax - vmin)))
+                fill_color = warnings[key][1] if key in warnings else ACCENT
+                pygame.draw.rect(self.screen, BORDER, track, border_radius=3)
+                fill_w = int(track.w * frac)
+                if fill_w > 0:
+                    pygame.draw.rect(self.screen, fill_color,
+                                     pygame.Rect(track.x, track.y, fill_w, track.h),
+                                     border_radius=3)
+                knob_x = track.x + fill_w
+                knob_y = track.centery
+                pygame.draw.circle(self.screen, BACKGROUND, (knob_x, knob_y), 10)
+                pygame.draw.circle(self.screen, fill_color, (knob_x, knob_y), 8)
+                if key in warnings:
+                    wtext, wcolor = warnings[key]
+                    draw_text(self.screen, wtext, (track.x, row_y + 52), 12, wcolor)
+
+            # Right-side boolean toggles
+            for rect, attr, title, desc in self._get_gameplay_toggle_rects():
+                val = bool(getattr(self, attr, False))
+                hov = rect.collidepoint(self.mouse_pos)
+                pygame.draw.rect(
+                    self.screen,
+                    LIST_ROW_SEL if val else (PANEL_HOVER if hov else FIELD_BG),
+                    rect, border_radius=10,
+                )
+                pygame.draw.rect(
+                    self.screen, ACCENT if val else BORDER,
+                    rect, width=2 if val else 1, border_radius=10,
+                )
+                chk = pygame.Rect(rect.right - 52, rect.y + 18, 36, 20)
+                pygame.draw.rect(self.screen, ACCENT if val else BORDER, chk, border_radius=10)
+                kx = chk.right - 10 if val else chk.x + 10
+                pygame.draw.circle(self.screen, (250, 250, 252), (kx, chk.centery), 7)
+                draw_text(self.screen, title, (rect.x + 16, rect.y + 14), 15, TEXT_COLOR, bold=True)
+                draw_text(self.screen, desc, (rect.x + 16, rect.y + 42), 12, DIM_TEXT)
+
+        elif self.settings_tab == 1:
+            draw_text(self.screen, "BOARD SKINS (PREMADE & CUSTOM)",
+                      (panel.x + 30, panel.y + 110), 13, ACCENT, bold=True)
+            for rect, skin_key, label in self._get_board_skin_rects():
+                self._draw_settings_button(
+                    rect, label, active=(self.board_skin == skin_key)
+                )
+
+            l_col, d_col = ef.resolve_board_colors(
+                self.board_skin, self.custom_light_sq, self.custom_dark_sq
+            )
+            for tr, ry, which, ch_idx, lbl in self._get_rgb_slider_rects():
+                c_val = l_col[ch_idx] if which == "light" else d_col[ch_idx]
+                draw_text(self.screen, f"{lbl}: {c_val}", (tr.x, ry), 13, TEXT_COLOR)
+                pygame.draw.rect(self.screen, BORDER, tr, border_radius=3)
+                fw = int(round(tr.w * (c_val / 255.0)))
+                ch_col = ((230, 95, 95), (95, 205, 125), (95, 155, 240))[ch_idx]
+                if fw > 0:
+                    pygame.draw.rect(self.screen, ch_col,
+                                     pygame.Rect(tr.x, tr.y, fw, tr.h), border_radius=3)
+                pygame.draw.circle(self.screen, ch_col, (tr.x + fw, tr.centery), 7)
+
+            draw_text(self.screen, "PIECE STYLE",
+                      (panel.x + 30, panel.y + 484), 13, ACCENT, bold=True)
+            for rect, style_key, label in self._get_piece_style_rects():
+                self._draw_settings_button(
+                    rect, label, active=(self.piece_style == style_key)
+                )
+
+            # Live preview chessboard
+            prev_size = 256
+            prev_pos = (panel.right - prev_size - 56, panel.y + 176)
+            draw_text(self.screen, "LIVE PREVIEW",
+                      (prev_pos[0], prev_pos[1] - 24), 13, GOLD, bold=True)
+            preview_fen = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 3"
+            draw_board(
+                self.screen, preview_fen, prev_pos,
+                flipped=self.cfg_auto_rotate_board,
+                show_coords=not self.cfg_hide_coords,
+                light_col=l_col, dark_col=d_col,
+                piece_style=self.piece_style,
+                board_size=prev_size,
+            )
+            pygame.draw.rect(
+                self.screen, BORDER,
+                pygame.Rect(prev_pos[0] - 2, prev_pos[1] - 2, prev_size + 4, prev_size + 4),
+                width=2,
+            )
+
+        elif self.settings_tab == 2:
+            draw_text(self.screen, "APPEARANCE MODE",
+                      (panel.x + 30, panel.y + 118), 13, ACCENT, bold=True)
+            dark_rect, light_rect, accent_rects = self._get_theme_option_rects()
+            self._draw_settings_button(
+                dark_rect, "Dark Mode", active=(self.theme_mode == "dark")
+            )
+            self._draw_settings_button(
+                light_rect, "Light Mode", active=(self.theme_mode == "light")
+            )
+
+            draw_text(self.screen, "ACCENT COLOR",
+                      (panel.x + 30, panel.y + 244), 13, ACCENT, bold=True)
+            for rect, akey, label in accent_rects:
+                preset = ef.ACCENT_PRESETS[akey]
+                swatch = preset["light"] if self.theme_mode == "light" else preset["dark"]
+                sel = (self.accent_key == akey)
+                hov = rect.collidepoint(self.mouse_pos)
+                pygame.draw.rect(
+                    self.screen,
+                    LIST_ROW_SEL if sel else (PANEL_HOVER if hov else FIELD_BG),
+                    rect, border_radius=10,
+                )
+                pygame.draw.rect(
+                    self.screen, swatch if sel else BORDER,
+                    rect, width=2 if sel else 1, border_radius=10,
+                )
+                pygame.draw.circle(self.screen, swatch, (rect.x + 26, rect.centery), 12)
+                draw_text(self.screen, label, (rect.x + 48, rect.centery - 9),
+                          15, TEXT_COLOR, bold=sel)
+
         self._draw_settings_button(self.settings_reset_rect,
                                    "Reset Defaults", primary=False)
         self._draw_settings_button(self.settings_cancel_rect,
@@ -3719,17 +5212,17 @@ class EloifyApp:
         self.screen.blit(self._menu_bg_gradient, (0, 0))
         self._update_menu_particles()
         self._draw_menu_particles()
-        knight_font = _get_piece_font(72)
+        knight_font = _get_piece_font(68)
         try:
             knight = knight_font.render("♞", True, ACCENT)
         except Exception:
             knight = None
-        title_font = _get_font(_FONT_FAMILY, 68, True)
+        title_font = _get_font(_FONT_FAMILY, 64, True)
         title_surf = title_font.render("Eloify", True, ACCENT)
         th = title_surf.get_height()
-        kx = 60
+        kx = 50
         if knight is not None:
-            ky = 34 + (th - knight.get_height()) // 2
+            ky = 26 + (th - knight.get_height()) // 2
             self.screen.blit(knight, (kx, ky))
             tx = kx + knight.get_width() + 14
         else:
@@ -3740,22 +5233,31 @@ class EloifyApp:
         glow_copy.set_alpha(pulse_alpha)
         self.screen.blit(
             glow_copy,
-            (tx - 30, 30 + (th - glow_copy.get_height()) // 2 + 4))
-        self.screen.blit(title_surf, (tx, 34))
-        draw_text(self.screen, "v1.0", (WINDOW_WIDTH - 90, 52), 16, DIM_TEXT, bold=True)
-        draw_text(self.screen, "Chess Engine Elo Tester",
-                  (60, 128), 20, DIM_TEXT)
-        pygame.draw.line(self.screen, BORDER,
-                         (60, 158), (WINDOW_WIDTH - 60, 158), 1)
+            (tx - 30, 22 + (th - glow_copy.get_height()) // 2 + 4))
+        self.screen.blit(title_surf, (tx, 26))
 
+        qt_rect = getattr(self, "quick_theme_rect", None)
+        if qt_rect is not None and hasattr(self, "_draw_settings_button"):
+            mode_lbl = "☀ Light Mode" if getattr(self, "theme_mode", "dark") == "dark" else "🌙 Dark Mode"
+            self._draw_settings_button(qt_rect, mode_lbl)
+
+        draw_text(self.screen, "Chess Engine Elo Tester  ·  Match & Move-Quality Rating Suite",
+                  (50, 114), 18, DIM_TEXT)
+        pygame.draw.line(self.screen, BORDER,
+                         (50, 146), (WINDOW_WIDTH - 50, 146), 1)
+
+        # Left column: SYSTEM + ENGINE POOL
+        tracking_lbl = "ON" if getattr(self, "cfg_engine_data_tracking", False) else "OFF"
         left_rows = [
-            ("CPU cores",        str(self.cfg_cpu_cores),               TEXT_COLOR),
-            ("Threads / engine", str(self.cfg_threads),                 TEXT_COLOR),
-            ("Hash / engine",    f"{int(self.cfg_hash)} MB",            TEXT_COLOR),
-            ("Time / move",      f"{self.cfg_time:.2f} s",              TEXT_COLOR),
+            ("CPU / Threads", f"{self.cfg_cpu_cores} cores  ·  {self.cfg_threads}T", TEXT_COLOR),
+            ("Hash / Move",   f"{int(self.cfg_hash)} MB  ·  {self.cfg_time:.2f}s", TEXT_COLOR),
+            ("Board / Pieces", f"{ef.BOARD_SKINS.get(getattr(self, 'board_skin', 'classic_wood'), ('Classic',))[0]} · {ef.PIECE_STYLES.get(getattr(self, 'piece_style', 'classic_2tone'), '2-Tone')}", TEXT_COLOR)
+            if globals().get("ef") is not None else ("Hash / engine", f"{int(self.cfg_hash)} MB", TEXT_COLOR),
+            ("Data tracking", tracking_lbl, ACCENT if tracking_lbl == "ON" else DIM_TEXT),
         ]
-        self._draw_stat_panel(pygame.Rect(60, 176, 420, 184),
-                              "SYSTEM", left_rows, accent=ACCENT)
+        sys_rect = pygame.Rect(50, 168, 450, 164)
+        self._draw_stat_panel(sys_rect, "SYSTEM & SETTINGS", left_rows, accent=ACCENT)
+        self.edit_system_rect = pygame.Rect(sys_rect.right - 78, sys_rect.y + 10, 58, 24)
         self._draw_edit_button(self.edit_system_rect)
 
         ext_tier_count, ext_max_elo = get_pool_max_extended_elo()
@@ -3765,57 +5267,123 @@ class EloifyApp:
                      if ext_tier_count > 0 else str(len(OPPONENTS)))
         games_value = (f"{base_games} (+{ext_games} top)"
                        if ext_games > 0 else str(base_games))
-        right_rows = [
-            ("Opponents", opp_value, TEXT_COLOR),
-            ("Games / opponent", str(GAMES_PER_OPPONENT), TEXT_COLOR),
-            ("Total games", games_value, GOLD),
+        pool_rows = [
+            ("Opponents",        opp_value, TEXT_COLOR),
+            ("Games / opponent", f"{GAMES_PER_OPPONENT}  (30s chess clock)", TEXT_COLOR),
+            ("Total games",      games_value, GOLD),
+            ("Draw rules",       "3-fold rep  ·  50-move rule", TEXT_COLOR),
         ]
         if OPPONENTS:
             lo = min(r for _, r in OPPONENTS)
             hi = max(max(r for _, r in OPPONENTS), ext_max_elo)
-            right_rows.append(("Rating range", f"{lo} – {hi}", TEXT_COLOR))
-        self._draw_stat_panel(pygame.Rect(520, 176, 420, 184),
-                              "ENGINE POOL", right_rows, accent=GOLD)
+            pool_rows.append(("Elo scale", f"{lo} – {hi}", ACCENT))
+        self._draw_stat_panel(pygame.Rect(50, 348, 450, 188),
+                              "ENGINE POOL", pool_rows, accent=GOLD)
 
-        status_rect = pygame.Rect(60, 380, 880, 96)
+        # Right column: ENGINE PLAYLIST ("NEXT IN LINE")
+        pl_panel = pygame.Rect(524, 168, WINDOW_WIDTH - 574, 368)
+        pygame.draw.rect(self.screen, PANEL, pl_panel, border_radius=12)
+        pygame.draw.rect(self.screen, BORDER, pl_panel, width=1, border_radius=12)
+        draw_text(self.screen, "ENGINE PLAYLIST  (NEXT IN LINE)",
+                  (pl_panel.x + 20, pl_panel.y + 15), 14, ACCENT, bold=True)
+        self.playlist_add_rect = pygame.Rect(pl_panel.right - 196, pl_panel.y + 10, 108, 26)
+        self.playlist_clear_rect = pygame.Rect(pl_panel.right - 80, pl_panel.y + 10, 62, 26)
+        if hasattr(self, "_draw_settings_button"):
+            self._draw_settings_button(self.playlist_add_rect, "+ Add Engine", primary=True)
+            self._draw_settings_button(self.playlist_clear_rect, "Clear", primary=False)
+        pygame.draw.line(self.screen, BORDER,
+                         (pl_panel.x + 20, pl_panel.y + 44),
+                         (pl_panel.right - 20, pl_panel.y + 44), 1)
+
+        playlist = getattr(self, "engine_playlist", None) or (
+            [self.target_path] if self.target_path else []
+        )
+        self._playlist_row_hitboxes = []
+        if not playlist:
+            draw_text_centered(
+                self.screen,
+                "No engines queued yet.",
+                (pl_panel.centerx, pl_panel.centery - 14), 17, DIM_TEXT, bold=True,
+            )
+            draw_text_centered(
+                self.screen,
+                "Click 'Browse Engine' or '+ Add Engine' to queue multiple engines in line.",
+                (pl_panel.centerx, pl_panel.centery + 16), 13, DIM_TEXT,
+            )
+        else:
+            vis = 6
+            p_scroll = max(0, min(getattr(self, "playlist_scroll", 0), max(0, len(playlist) - vis)))
+            self.playlist_scroll = p_scroll
+            for row_i, p_path in enumerate(playlist[p_scroll:p_scroll + vis]):
+                abs_i = p_scroll + row_i
+                ry = pl_panel.y + 54 + row_i * 48
+                rrect = pygame.Rect(pl_panel.x + 16, ry, pl_panel.w - 32, 42)
+                is_first = (abs_i == 0)
+                row_sel_bg = globals().get("LIST_ROW_SEL", PANEL_HOVER)
+                field_bg = globals().get("FIELD_BG", PANEL)
+                pygame.draw.rect(
+                    self.screen,
+                    row_sel_bg if is_first else field_bg,
+                    rrect, border_radius=8,
+                )
+                pygame.draw.rect(
+                    self.screen, ACCENT if is_first else BORDER,
+                    rrect, width=1, border_radius=8,
+                )
+                badge = "NEXT UP" if is_first else f"#{abs_i + 1}"
+                draw_text(self.screen, badge, (rrect.x + 12, rrect.y + 12),
+                          12, ACCENT if is_first else DIM_TEXT, bold=True)
+                bname = os.path.basename(p_path)
+                disp = bname if len(bname) <= 36 else bname[:33] + "…"
+                draw_text(self.screen, disp, (rrect.x + 82, rrect.y + 11),
+                          15, TEXT_COLOR, bold=is_first)
+
+                if hasattr(self, "_playlist_row_hitboxes") and getattr(self, "engine_playlist", None):
+                    up_r = pygame.Rect(rrect.right - 106, rrect.y + 8, 28, 26)
+                    dn_r = pygame.Rect(rrect.right - 74, rrect.y + 8, 28, 26)
+                    rm_r = pygame.Rect(rrect.right - 40, rrect.y + 8, 30, 26)
+                    for btn_r, sym, col in (
+                        (up_r, "↑", TEXT_COLOR if abs_i > 0 else DIM_TEXT),
+                        (dn_r, "↓", TEXT_COLOR if abs_i + 1 < len(playlist) else DIM_TEXT),
+                        (rm_r, "✕", LOSS_COLOR),
+                    ):
+                        pygame.draw.rect(self.screen, PANEL, btn_r, border_radius=5)
+                        pygame.draw.rect(self.screen, BORDER, btn_r, width=1, border_radius=5)
+                        s = _render_text(sym, 13, col, True)
+                        self.screen.blit(s, s.get_rect(center=btn_r.center))
+                    self._playlist_row_hitboxes.append(("up", abs_i, up_r))
+                    self._playlist_row_hitboxes.append(("down", abs_i, dn_r))
+                    self._playlist_row_hitboxes.append(("remove", abs_i, rm_r))
+
+        # Status bar
+        status_rect = pygame.Rect(50, 552, WINDOW_WIDTH - 100, 98)
         pygame.draw.rect(self.screen, PANEL, status_rect, border_radius=12)
         pygame.draw.rect(self.screen, BORDER, status_rect, width=1, border_radius=12)
         draw_text(self.screen, "STATUS",
-                  (status_rect.x + 20, status_rect.y + 14), 13, ACCENT, bold=True)
+                  (status_rect.x + 20, status_rect.y + 12), 13, ACCENT, bold=True)
         draw_text(self.screen, self.status_text,
-                  (status_rect.x + 20, status_rect.y + 40), 18, TEXT_COLOR)
-        draw_text(self.screen, "Adjudicator: " + os.path.basename(ADJUDICATOR_PATH),
-                  (status_rect.x + 20, status_rect.y + 68), 13, DIM_TEXT)
+                  (status_rect.x + 20, status_rect.y + 36), 17, TEXT_COLOR)
+        draw_text(self.screen, "Live Eval Adjudicator: " + os.path.basename(ADJUDICATOR_PATH) + " (low-thread / low-hash)",
+                  (status_rect.x + 20, status_rect.y + 66), 13, DIM_TEXT)
 
-        if self.target_path:
-            fname = os.path.basename(self.target_path)
-            disp = fname if len(fname) <= 38 else fname[:35] + "…"
-            chip_font_w = _render_text(disp, 15, WIN_COLOR, True).get_width()
-            chip_w = min(560, chip_font_w + 60)
-            chip_x = status_rect.right - chip_w - 20
-            chip_rect = pygame.Rect(chip_x, status_rect.y + 26, chip_w, 46)
-            pygame.draw.rect(self.screen, (32, 62, 48), chip_rect, border_radius=8)
-            pygame.draw.rect(self.screen, (75, 160, 115), chip_rect,
-                             width=1, border_radius=8)
-            draw_text(self.screen, "✓",
-                      (chip_rect.x + 14, chip_rect.y + 12), 18, WIN_COLOR, bold=True)
-            draw_text(self.screen, disp,
-                      (chip_rect.x + 42, chip_rect.y + 14), 15, WIN_COLOR, bold=True)
-        else:
-            draw_text(self.screen, "(no engine selected)",
-                      (status_rect.right - 260, status_rect.y + 40),
-                      15, DIM_TEXT)
-
+        can_start = bool(self.target_path or getattr(self, "engine_playlist", None))
+        start_lbl = (
+            f"Start Playlist ({len(playlist)})"
+            if len(playlist) > 1 else "Start Test"
+        )
         self._draw_menu_button(self.browse_rect, "Browse Engine",
                                enabled=True, primary=False)
-        self._draw_menu_button(self.start_rect, "Start Test",
-                               enabled=self.target_path is not None,
-                               primary=True)
+        cust_r = getattr(self, "customize_rect", None)
+        if cust_r is not None:
+            self._draw_menu_button(cust_r, "Settings & Customize",
+                                   enabled=True, primary=False)
+        self._draw_menu_button(self.start_rect, start_lbl,
+                               enabled=can_start, primary=True)
 
         draw_text_centered(
             self.screen,
             "Eloify  ·  Built for chess engine developers",
-            (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 26),
+            (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 20),
             13, DIM_TEXT)
 
     def draw_running(self):
@@ -3823,88 +5391,336 @@ class EloifyApp:
         if w is None:
             return
         self._update_animation()
+        _ef = globals().get("ef")
+
+        # Update non-blocking live evaluation worker with latest board FEN
+        lew = getattr(self, "live_eval_worker", None)
+        if lew is not None:
+            lew.request_fen(w.current_fen_shared)
+            eval_cp, eval_mate = lew.get_eval(w.current_fen_shared)
+        elif _ef is not None:
+            eval_cp, eval_mate = _ef.evaluate_board_static_cp(_get_board(w.current_fen_shared))
+        else:
+            eval_cp, eval_mate = (0, None)
+
+        # Top header bar: Back to Menu + Title + Progress & ETA + Mute/Volume
+        back_r = getattr(self, "running_back_rect", pygame.Rect(20, 18, 112, 34))
+        if hasattr(self, "_draw_settings_button"):
+            self._draw_settings_button(back_r, "← Menu", primary=False)
+
         in_extension = (getattr(w, "high_elo_extended", False)
                         and w.current_opponent_index >= len(OPPONENTS))
-        header_title = ("High-Elo Extension (3600+)"
-                        if in_extension else "Tournament in Progress")
+        pl_paths = getattr(self, "active_playlist_paths", ())
+        pl_idx = getattr(self, "playlist_current_idx", 0)
+        pl_prefix = f"[{pl_idx + 1}/{len(pl_paths)}] " if len(pl_paths) > 1 else ""
+        header_title = pl_prefix + (
+            "High-Elo Extension (3600+)" if in_extension else "Tournament in Progress"
+        )
         header_color = GOLD if in_extension else ACCENT
-        draw_text(self.screen, header_title, (30, 20), 26, header_color, bold=True)
-        elapsed = int(time.time() - self.start_time) if self.start_time else 0
-        elapsed_str = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
-        draw_text(self.screen, f"Elapsed  {elapsed_str}", (830, 26), 18, DIM_TEXT)
-        draw_text(self.screen, f"Target: {w.target_name}", (30, 60), 20, TEXT_COLOR, bold=True)
-        draw_text(self.screen, f"Opponent: {w.opponent_name}  ·  {w.opponent_rating} Elo",
-                  (30, 86), 20, DIM_TEXT)
-        shown_game = min(w.games_played + 1, max(1, w.total_games))
-        draw_text(self.screen, f"Game {shown_game} / {w.total_games}",
-                  (830, 60), 18, DIM_TEXT)
-        draw_text(self.screen, f"W {w.wins}", (790, 86), 18, WIN_COLOR)
-        draw_text(self.screen, f"D {w.draws}", (845, 86), 18, DRAW_COLOR)
-        draw_text(self.screen, f"L {w.losses}", (900, 86), 18, LOSS_COLOR)
+        draw_text(self.screen, header_title, (146, 14), 22, header_color, bold=True)
 
+        elapsed_s = max(0.0, time.time() - self.start_time) if self.start_time else 0.0
+        elapsed_i = int(elapsed_s)
+        elapsed_str = f"{elapsed_i // 60:02d}:{elapsed_i % 60:02d}"
+        eta_str = "—"
+        if _ef is not None:
+            rem_engines = max(0, len(pl_paths) - (pl_idx + 1)) if len(pl_paths) > 1 else 0
+            eta_sec = _ef.estimate_tournament_eta_seconds(
+                elapsed_s,
+                w.games_played,
+                w.total_games,
+                time_per_move=getattr(self, "cfg_time", TIME_LIMIT),
+                current_move_number=getattr(w, "current_move_number", 0),
+                extra_playlist_engines=rem_engines,
+                base_pool_games=len(OPPONENTS) * GAMES_PER_OPPONENT,
+            )
+            eta_str = _ef.format_eta(eta_sec)
+
+        frac = (w.games_played / w.total_games) if w.total_games else 0.0
+        pbar = pygame.Rect(514, 20, 448, 12)
+        pygame.draw.rect(self.screen, PANEL, pbar, border_radius=6)
+        pygame.draw.rect(self.screen, BORDER, pbar, width=1, border_radius=6)
+        if frac > 0:
+            pygame.draw.rect(
+                self.screen, ACCENT,
+                pygame.Rect(pbar.x, pbar.y, max(4, int(pbar.w * min(1.0, frac))), pbar.h),
+                border_radius=6,
+            )
+        draw_text(
+            self.screen,
+            f"Game {min(w.games_played + 1, max(1, w.total_games))}/{w.total_games} ({frac:.0%})   ·   Elapsed {elapsed_str}   ·   ETA {eta_str}",
+            (514, 38), 13, DIM_TEXT,
+        )
+        draw_text(self.screen, f"{w.target_name}  vs  {w.opponent_name} ({w.opponent_rating})",
+                  (146, 42), 14, TEXT_COLOR)
+
+        if hasattr(self, "_draw_audio_controls"):
+            self._draw_audio_controls(self.running_mute_rect, self.running_vol_rect)
+
+        pygame.draw.line(self.screen, BORDER, (18, 68), (WINDOW_WIDTH - 18, 68), 1)
+
+        # Board orientation (auto-rotate to Target's perspective if enabled)
+        flipped = bool(getattr(self, "cfg_auto_rotate_board", False) and not w.target_is_white)
+
+        # Live Evaluation Bar beside the board
+        eval_rect = pygame.Rect(20, BOARD_POS[1], 24, BOARD_SIZE)
+        if hasattr(self, "_draw_eval_bar"):
+            self._draw_eval_bar(eval_rect, eval_cp, eval_mate, flipped=flipped, badge="EVAL")
+
+        # Top & Bottom Player Strips + 30s Chess Clocks
+        w_clk, b_clk = w.get_live_clocks() if hasattr(w, "get_live_clocks") else (30.0, 30.0)
+        active_turn = getattr(w, "clock_active_color", None)
+        top_is_white = bool(flipped)
+        bot_is_white = not bool(flipped)
+
+        for is_top, side_white, strip_y in (
+            (True, top_is_white, BOARD_POS[1] - 42),
+            (False, bot_is_white, BOARD_POS[1] + BOARD_SIZE + 8),
+        ):
+            srect = pygame.Rect(BOARD_POS[0], strip_y, BOARD_SIZE, 34)
+            pygame.draw.rect(self.screen, PANEL, srect, border_radius=8)
+            pygame.draw.rect(self.screen, BORDER, srect, width=1, border_radius=8)
+            is_target_side = (side_white == bool(w.target_is_white))
+            pname = w.target_name if is_target_side else f"{w.opponent_name} ({w.opponent_rating})"
+            role_tag = "TARGET" if is_target_side else "OPP"
+            dot_col = (244, 244, 248) if side_white else (22, 24, 30)
+            pygame.draw.circle(self.screen, dot_col, (srect.x + 16, srect.centery), 7)
+            pygame.draw.circle(self.screen, BORDER, (srect.x + 16, srect.centery), 7, 1)
+            p_disp = pname if len(pname) <= 34 else pname[:31] + "…"
+            draw_text(self.screen, f"[{role_tag}] {p_disp}",
+                      (srect.x + 30, srect.y + 8), 14,
+                      ACCENT if is_target_side else TEXT_COLOR, bold=is_target_side)
+            clk_val = w_clk if side_white else b_clk
+            clk_rect = pygame.Rect(srect.right - 88, srect.y + 4, 82, 26)
+            if hasattr(self, "_draw_clock_pill"):
+                self._draw_clock_pill(clk_rect, clk_val, active=(active_turn is side_white))
+
+        # Chess Board
         last_move = None
         if self.last_move_from is not None and self.last_move_to is not None:
             last_move = (self.last_move_from, self.last_move_to)
-        draw_board(self.screen, w.current_fen_shared, BOARD_POS,
-                   self.animation, last_move=last_move)
+        draw_board(
+            self.screen, w.current_fen_shared, BOARD_POS,
+            self.animation, last_move=last_move,
+            flipped=flipped,
+            show_coords=not getattr(self, "cfg_hide_coords", False),
+        )
         pygame.draw.rect(self.screen, BORDER,
                          pygame.Rect(BOARD_POS[0] - 2, BOARD_POS[1] - 2,
                                      BOARD_SIZE + 4, BOARD_SIZE + 4),
                          width=2)
 
-        info_panel = pygame.Rect(520, 130, 460, 490)
-        draw_rounded_panel(self.screen, info_panel)
-        x, y = INFO_POS
-        x += 6
-        y -= 4
-
-        draw_section(self.screen, "TARGET ENGINE", (x, y), width=200)
-        draw_text(self.screen, w.target_name, (x, y + 24), 18, TEXT_COLOR)
-        draw_text(self.screen, f"Config: {w.target_config_str}",
-                  (x, y + 46), 14, DIM_TEXT)
-
-        draw_section(self.screen, "OPPONENT ENGINE", (x, y + 82), width=200)
-        draw_text(self.screen, f"{w.opponent_name}  ({w.opponent_rating})",
-                  (x, y + 106), 18, TEXT_COLOR)
-        draw_text(self.screen, f"Config: {w.opponent_config_str}",
-                  (x, y + 128), 14, DIM_TEXT)
-
-        draw_section(self.screen, "PROGRESS", (x, y + 164), width=420)
-        frac = (w.games_played / w.total_games) if w.total_games else 0.0
-        bar_rect = pygame.Rect(x, y + 190, 420, 8)
-        pygame.draw.rect(self.screen, (45, 50, 62), bar_rect, border_radius=4)
-        if frac > 0:
-            fill_w = max(2, int(bar_rect.width * frac))
-            pygame.draw.rect(self.screen, ACCENT,
-                             pygame.Rect(bar_rect.x, bar_rect.y, fill_w, bar_rect.height),
-                             border_radius=4)
-        draw_text(self.screen, f"{w.games_played} / {w.total_games} games  ({frac:.0%})",
-                  (x, y + 204), 14, DIM_TEXT)
-        draw_text(self.screen, f"W {w.wins}", (x, y + 226), 18, WIN_COLOR, bold=True)
-        draw_text(self.screen, f"D {w.draws}", (x + 70, y + 226), 18, DRAW_COLOR, bold=True)
-        draw_text(self.screen, f"L {w.losses}", (x + 140, y + 226), 18, LOSS_COLOR, bold=True)
-
-        draw_section(self.screen, "CURRENT GAME", (x, y + 262), width=420)
-        side = "White" if w.target_is_white else "Black"
+        # Footer below board: moves + optional Engine Data Tracking
+        foot_rect = pygame.Rect(20, 622, 478, 138)
+        draw_rounded_panel(self.screen, foot_rect)
         opening_label = getattr(w, "current_opening_name", "")
-        side_desc = (f"Target plays {side}  ·  {opening_label}"
-                     if opening_label else f"Target plays {side}")
-        dot_cx = x + 8
-        dot_cy = y + 296
-        dot_color = (245, 245, 245) if w.target_is_white else (15, 15, 15)
-        pygame.draw.circle(self.screen, dot_color, (dot_cx, dot_cy), 7)
-        pygame.draw.circle(self.screen, BORDER, (dot_cx, dot_cy), 7, width=1)
-        draw_text(self.screen, side_desc, (x + 22, y + 286), 16, TEXT_COLOR)
-        draw_text(self.screen,
-                  f"Move {w.current_move_number}   ·   Last: {w.last_move_san or '—'}",
-                  (x, y + 310), 16, DIM_TEXT)
+        mv_hdr = f"Move {w.current_move_number}  ·  Last: {w.last_move_san or '—'}"
+        if opening_label:
+            mv_hdr += f"  ·  {opening_label}"
+        draw_text(self.screen, mv_hdr, (foot_rect.x + 14, foot_rect.y + 10), 14, TEXT_COLOR, bold=True)
         recent = " ".join(w.recent_moves[-8:]) if w.recent_moves else "—"
-        draw_text(self.screen, f"Recent: {recent}", (x, y + 334), 14, DIM_TEXT)
+        draw_text(self.screen, f"Moves: {recent}", (foot_rect.x + 14, foot_rect.y + 32), 13, DIM_TEXT)
 
-        draw_section(self.screen, "LAST RESULT", (x, y + 368), width=420)
+        if getattr(self, "cfg_engine_data_tracking", False):
+            rs = getattr(w, "resource_summary", None) or {}
+            cpu_now = rs.get("live_cpu_pct", 0.0)
+            cpu_pk  = rs.get("peak_cpu_pct", 0.0)
+            ram_now = rs.get("live_ram_mb", 0.0)
+            ram_pk  = rs.get("peak_ram_mb", 0.0)
+            thr_n   = rs.get("live_threads", getattr(self, "cfg_threads", 1))
+            nps_v   = rs.get("live_nps", 0)
+            nps_str = f"{nps_v / 1e6:.2f}M" if nps_v >= 1_000_000 else (f"{nps_v / 1e3:.0f}k" if nps_v >= 1000 else str(nps_v))
+            pygame.draw.line(self.screen, BORDER,
+                             (foot_rect.x + 14, foot_rect.y + 58),
+                             (foot_rect.right - 14, foot_rect.y + 58), 1)
+            draw_text(self.screen, "ENGINE DATA TRACKING",
+                      (foot_rect.x + 14, foot_rect.y + 66), 12, ACCENT, bold=True)
+            draw_text(
+                self.screen,
+                f"CPU: {cpu_now:.1f}% (Peak {cpu_pk:.0f}%)   ·   RAM: {ram_now:.1f} MB (Peak {ram_pk:.1f} MB)",
+                (foot_rect.x + 14, foot_rect.y + 86), 13, TEXT_COLOR,
+            )
+            draw_text(
+                self.screen,
+                f"OS Threads: {thr_n}   ·   UCI Speed: {nps_str} nps",
+                (foot_rect.x + 14, foot_rect.y + 108), 13, DIM_TEXT,
+            )
+        else:
+            draw_text(self.screen, self.status_text[:66],
+                      (foot_rect.x + 14, foot_rect.y + 68), 13, DIM_TEXT)
+            if len(pl_paths) > 1 and pl_idx + 1 < len(pl_paths):
+                nxt = os.path.basename(pl_paths[pl_idx + 1])
+                draw_text(self.screen, f"Next in playlist: {nxt}",
+                          (foot_rect.x + 14, foot_rect.y + 96), 13, GOLD, bold=True)
+
+        # Middle Matchup Column
+        mid_panel = pygame.Rect(514, 92, 330, 668)
+        draw_rounded_panel(self.screen, mid_panel)
+        mx, my = mid_panel.x + 16, mid_panel.y + 14
+        mw = mid_panel.w - 32
+
+        draw_section(self.screen, "TARGET ENGINE", (mx, my), width=mw)
+        draw_text(self.screen, w.target_name[:32], (mx, my + 24), 17, TEXT_COLOR, bold=True)
+        draw_text(self.screen, f"Config: {w.target_config_str}", (mx, my + 46), 13, DIM_TEXT)
+        draw_text(self.screen, f"W {w.wins}", (mx, my + 70), 17, WIN_COLOR, bold=True)
+        draw_text(self.screen, f"D {w.draws}", (mx + 74, my + 70), 17, DRAW_COLOR, bold=True)
+        draw_text(self.screen, f"L {w.losses}", (mx + 148, my + 70), 17, LOSS_COLOR, bold=True)
+
+        mq_sum = getattr(w, "move_quality_summary", None)
+        if mq_sum:
+            draw_text(
+                self.screen,
+                f"Move-Quality Elo: {mq_sum['move_quality_elo']:.0f}  ({mq_sum['accuracy_pct']:.1f}% acc · {mq_sum['acpl']:.1f} ACPL)",
+                (mx, my + 98), 13, GOLD, bold=True,
+            )
+        else:
+            draw_text(self.screen, "Move-Quality Elo: awaiting completed game…",
+                      (mx, my + 98), 13, DIM_TEXT)
+
+        draw_section(self.screen, "CURRENT OPPONENT", (mx, my + 134), width=mw)
+        draw_text(self.screen, f"{w.opponent_name[:26]}", (mx, my + 158), 16, TEXT_COLOR, bold=True)
+        draw_text(self.screen, f"Rating: {w.opponent_rating} Elo  (Scale 300–4010)",
+                  (mx, my + 180), 13, ACCENT, bold=True)
+        if _ef is not None and w.opponent_rating > 0:
+            pal = self._current_palette() if hasattr(self, "_current_palette") else {"mode": "dark", "ACCENT": ACCENT, "GOLD": GOLD, "TEXT_COLOR": TEXT_COLOR, "DIM_TEXT": DIM_TEXT}
+            _ef.draw_elo_scale_bar(
+                self.screen,
+                pygame.Rect(mx, my + 202, mw, 16),
+                w.opponent_rating,
+                pal,
+                show_endpoints=True,
+                font_getter=lambda sz, bold=False: _get_font(_FONT_FAMILY, sz, bold=bold),
+            )
+        draw_text(self.screen, f"Config: {w.opponent_config_str}",
+                  (mx, my + 236), 12, DIM_TEXT)
+
+        draw_section(self.screen, "LAST GAME", (mx, my + 268), width=mw)
         draw_text(self.screen, w.last_game_result or "—",
-                  (x, y + 392), 16, TEXT_COLOR)
-        draw_text(self.screen, self.status_text, (30, 700), 14, DIM_TEXT)
+                  (mx, my + 292), 15, TEXT_COLOR, bold=True)
+        last_mq = getattr(w, "last_game_move_quality", None)
+        if last_mq:
+            draw_text(
+                self.screen,
+                f"Game Move Elo: {last_mq['move_quality_elo']:.0f}  ·  Accuracy {last_mq['accuracy_pct']:.1f}%",
+                (mx, my + 316), 13, ACCENT,
+            )
+
+        draw_section(self.screen, "PLAYLIST & STATUS", (mx, my + 354), width=mw)
+        if len(pl_paths) > 1:
+            for q_i, qp in enumerate(pl_paths[:6]):
+                q_tag = "✓" if q_i < pl_idx else ("▶" if q_i == pl_idx else f"{q_i + 1}.")
+                q_col = WIN_COLOR if q_i < pl_idx else (ACCENT if q_i == pl_idx else DIM_TEXT)
+                draw_text(
+                    self.screen,
+                    f"{q_tag} {os.path.basename(qp)[:30]}",
+                    (mx, my + 378 + q_i * 22), 13, q_col, bold=(q_i == pl_idx),
+                )
+            draw_text(self.screen, self.status_text[:42], (mx, my + 520), 12, DIM_TEXT)
+        else:
+            draw_text(self.screen, "Single-engine test active", (mx, my + 380), 14, TEXT_COLOR)
+            draw_text(self.screen, "Rules: 3-fold rep · 50-move · 30s clock", (mx, my + 404), 12, DIM_TEXT)
+            draw_text(self.screen, self.status_text[:42], (mx, my + 432), 12, DIM_TEXT)
+
+        # Right Column: Scrollable Opponents Progress & Upcoming Skip Menu
+        opp_panel = pygame.Rect(858, 92, 362, 668)
+        draw_rounded_panel(self.screen, opp_panel)
+        draw_text(self.screen, "OPPONENTS PROGRESS",
+                  (opp_panel.x + 14, opp_panel.y + 12), 14, ACCENT, bold=True)
+        draw_text(self.screen, "Scroll ↑ past  ·  Skip upcoming ↓",
+                  (opp_panel.x + 14, opp_panel.y + 32), 12, DIM_TEXT)
+        self._running_follow_live_rect = None
+        if not getattr(self, "running_opp_autoscroll", True) and hasattr(self, "_draw_settings_button"):
+            fl_r = pygame.Rect(opp_panel.right - 76, opp_panel.y + 10, 62, 22)
+            self._draw_settings_button(fl_r, "Live", active=True)
+            self._running_follow_live_rect = fl_r
+        pygame.draw.line(self.screen, BORDER,
+                         (opp_panel.x + 12, opp_panel.y + 52),
+                         (opp_panel.right - 12, opp_panel.y + 52), 1)
+
+        entries = (
+            w.get_schedule_snapshot()
+            if hasattr(w, "get_schedule_snapshot")
+            else []
+        )
+        vis_rows = 11
+        max_opp_scroll = max(0, len(entries) - vis_rows)
+        if getattr(self, "running_opp_autoscroll", True):
+            playing_pos = next(
+                (i for i, e in enumerate(entries) if e["status"] == "playing"),
+                getattr(w, "current_opponent_index", 0),
+            )
+            self.running_opp_scroll = max(0, min(playing_pos - 3, max_opp_scroll))
+        else:
+            self.running_opp_scroll = max(
+                0, min(getattr(self, "running_opp_scroll", 0), max_opp_scroll)
+            )
+
+        self._running_skip_hitboxes = []
+        pal = (
+            self._current_palette()
+            if hasattr(self, "_current_palette")
+            else {"mode": "dark", "ACCENT": ACCENT, "GOLD": GOLD, "TEXT_COLOR": TEXT_COLOR, "DIM_TEXT": DIM_TEXT}
+        )
+        row_h = 54
+        start_y = opp_panel.y + 58
+        for view_i, entry in enumerate(entries[self.running_opp_scroll:self.running_opp_scroll + vis_rows]):
+            ry = start_y + view_i * row_h
+            rrect = pygame.Rect(opp_panel.x + 10, ry, opp_panel.w - 26, row_h - 4)
+            st = entry["status"]
+            is_live = (st == "playing")
+            row_bg = (globals().get("LIST_ROW_SEL", PANEL_HOVER)
+                      if is_live else globals().get("FIELD_BG", PANEL))
+            row_bdr = ACCENT if is_live else BORDER
+            pygame.draw.rect(self.screen, row_bg, rrect, border_radius=7)
+            pygame.draw.rect(self.screen, row_bdr, rrect, width=2 if is_live else 1, border_radius=7)
+
+            ename = entry["name"]
+            edisp = ename if len(ename) <= 22 else ename[:20] + "…"
+            name_col = DIM_TEXT if st in ("skipped", "unavailable") else TEXT_COLOR
+            draw_text(self.screen, f"{edisp}  ({entry['rating']})",
+                      (rrect.x + 10, rrect.y + 6), 13, name_col, bold=is_live)
+
+            if _ef is not None:
+                _ef.draw_elo_scale_bar(
+                    self.screen,
+                    pygame.Rect(rrect.x + 10, rrect.y + 28, 196, 13),
+                    entry["rating"],
+                    pal,
+                    show_endpoints=False,
+                )
+
+            if st == "done":
+                res_s = f"{entry['w']}W-{entry['d']}D-{entry['l']}L"
+                tot_g = max(1, entry["w"] + entry["d"] + entry["l"])
+                sc = (entry["w"] + 0.5 * entry["d"]) / tot_g
+                rcol = WIN_COLOR if sc > 0.5 else (LOSS_COLOR if sc < 0.5 else DRAW_COLOR)
+                draw_text(self.screen, res_s, (rrect.right - 92, rrect.y + 16), 13, rcol, bold=True)
+            elif st == "playing":
+                res_s = f"LIVE {entry['w']}-{entry['d']}-{entry['l']}"
+                draw_text(self.screen, res_s, (rrect.right - 96, rrect.y + 16), 12, ACCENT, bold=True)
+            elif st in ("pending", "skipped"):
+                btn_r = pygame.Rect(rrect.right - 76, rrect.y + 11, 66, 26)
+                hov = btn_r.collidepoint(self.mouse_pos)
+                is_sk = (st == "skipped")
+                bfill = LOSS_COLOR if is_sk else (PANEL_HOVER if hov else PANEL)
+                btcol = (250, 250, 252) if is_sk else TEXT_COLOR
+                pygame.draw.rect(self.screen, bfill, btn_r, border_radius=5)
+                pygame.draw.rect(self.screen, ACCENT if hov else BORDER, btn_r, width=1, border_radius=5)
+                blbl = "Unskip" if is_sk else "Skip"
+                bs = _render_text(blbl, 12, btcol, True)
+                self.screen.blit(bs, bs.get_rect(center=btn_r.center))
+                self._running_skip_hitboxes.append((entry["index"], btn_r))
+            else:
+                draw_text(self.screen, "N/A", (rrect.right - 50, rrect.y + 16), 12, DIM_TEXT)
+
+        if max_opp_scroll > 0:
+            sb_x = opp_panel.right - 10
+            sb_y = start_y
+            sb_h = vis_rows * row_h - 6
+            th_h = max(24, int(sb_h * vis_rows / max(1, len(entries))))
+            th_y = sb_y + int((sb_h - th_h) * self.running_opp_scroll / max_opp_scroll)
+            pygame.draw.rect(self.screen, BORDER, pygame.Rect(sb_x, sb_y, 4, sb_h), border_radius=2)
+            pygame.draw.rect(self.screen, ACCENT, pygame.Rect(sb_x, th_y, 4, th_h), border_radius=2)
 
     def _copy_error_report(self):
         try:
@@ -3935,23 +5751,233 @@ class EloifyApp:
         self._draw_browse_button(ERROR_COPY_RECT, "Copy report", primary=True)
         self._draw_browse_button(ERROR_BACK_RECT, "Back to menu")
 
+    def _draw_replay_view(self):
+        g = self.replay_game
+        if not g:
+            return
+        _ef = globals().get("ef")
+        plies = g.get("plies", ())
+        ply_idx = max(0, min(int(getattr(self, "replay_ply", 0)), len(plies)))
+        fen = self._replay_current_fen()
+        flipped = self._effective_replay_flipped()
+
+        # Header
+        self._draw_settings_button(self.replay_back_rect, "← Back to Results", primary=False)
+        self._draw_settings_button(self.replay_flip_rect, "Flip Board (F)", active=flipped)
+        title = (
+            f"Game #{g.get('game_number', 1)}:  {g.get('target_name', 'Target')} "
+            f"({'White' if g.get('target_is_white') else 'Black'})  vs  "
+            f"{g.get('opponent_name', 'Opponent')} ({g.get('opponent_rating', 0)})   ·   {g.get('pgn_result', '')}"
+        )
+        draw_text(self.screen, title[:82], (322, 20), 17, ACCENT, bold=True)
+        pygame.draw.line(self.screen, BORDER, (20, 58), (WINDOW_WIDTH - 20, 58), 1)
+
+        # Stronger Stockfish Eval Bar
+        rew = getattr(self, "replay_eval_worker", None)
+        if rew is not None:
+            rew.request_fen(fen)
+            ev_cp, ev_mate, ev_depth = rew.get_eval(fen)
+            badge = f"d{ev_depth}" if ev_depth > 0 else "EVAL"
+        elif _ef is not None:
+            ev_cp, ev_mate = _ef.evaluate_board_static_cp(_get_board(fen))
+            ev_depth = 0
+            badge = "EVAL"
+        else:
+            ev_cp, ev_mate, ev_depth, badge = 0, None, 0, "EVAL"
+
+        bsize = 464
+        bpos = (64, 112)
+        self._draw_eval_bar(
+            pygame.Rect(28, bpos[1], 26, bsize),
+            ev_cp, ev_mate, flipped=flipped, badge=badge,
+        )
+
+        # Clocks at selected ply
+        init_clk = 30.0
+        if ply_idx == 0:
+            w_left, b_left, mv_time, cur_ply_obj = init_clk, init_clk, 0.0, None
+        else:
+            cur_ply_obj = plies[ply_idx - 1]
+            w_left = cur_ply_obj.get("white_left", init_clk)
+            b_left = cur_ply_obj.get("black_left", init_clk)
+            mv_time = cur_ply_obj.get("move_time", 0.0)
+
+        for side_white, sy in ((bool(flipped), bpos[1] - 40), (not bool(flipped), bpos[1] + bsize + 8)):
+            srect = pygame.Rect(bpos[0], sy, bsize, 32)
+            pygame.draw.rect(self.screen, PANEL, srect, border_radius=7)
+            pygame.draw.rect(self.screen, BORDER, srect, width=1, border_radius=7)
+            is_t = (side_white == bool(g.get("target_is_white", True)))
+            nm = g.get("target_name", "Target") if is_t else f"{g.get('opponent_name', 'Opponent')} ({g.get('opponent_rating', 0)})"
+            draw_text(self.screen, nm[:36], (srect.x + 14, srect.y + 7),
+                      14, ACCENT if is_t else TEXT_COLOR, bold=is_t)
+            cval = w_left if side_white else b_left
+            self._draw_clock_pill(
+                pygame.Rect(srect.right - 90, srect.y + 3, 84, 26),
+                cval,
+                active=(cur_ply_obj is not None and cur_ply_obj.get("mover_is_white") == side_white),
+            )
+
+        last_mv = None
+        if cur_ply_obj and len(cur_ply_obj.get("uci", "")) >= 4:
+            try:
+                last_mv = (
+                    chess.parse_square(cur_ply_obj["uci"][:2]),
+                    chess.parse_square(cur_ply_obj["uci"][2:4]),
+                )
+            except Exception:
+                last_mv = None
+
+        draw_board(
+            self.screen, fen, bpos,
+            last_move=last_mv,
+            flipped=flipped,
+            show_coords=not getattr(self, "cfg_hide_coords", False),
+            board_size=bsize,
+        )
+        pygame.draw.rect(
+            self.screen, BORDER,
+            pygame.Rect(bpos[0] - 2, bpos[1] - 2, bsize + 4, bsize + 4), width=2,
+        )
+
+        # Navigation buttons below board
+        nav_y = bpos[1] + bsize + 52
+        self._replay_nav_rects = []
+        nav_specs = [
+            ("first", "|◀ Start", 96),
+            ("prev",  "◀ Prev (A/←)", 128),
+            ("next",  "Next (D/→) ▶", 128),
+            ("last",  "End ▶|", 96),
+        ]
+        nx = bpos[0]
+        for act, lbl, bw in nav_specs:
+            nr = pygame.Rect(nx, nav_y, bw, 36)
+            self._draw_settings_button(nr, lbl)
+            self._replay_nav_rects.append((act, nr))
+            nx += bw + 6
+        draw_text(
+            self.screen,
+            "Use Left / Right arrows or A / D keys to step through moves",
+            (bpos[0], nav_y + 46), 13, DIM_TEXT,
+        )
+
+        # Right telemetry & move list panels
+        info_r = pygame.Rect(556, 72, 660, 220)
+        draw_rounded_panel(self.screen, info_r)
+        ix, iy = info_r.x + 18, info_r.y + 14
+        draw_section(self.screen, "MOVE TIMING, CLOCKS & ANALYSIS", (ix, iy), width=info_r.w - 36)
+        if cur_ply_obj is None:
+            opening_s = g.get("opening_name") or "Standard starting position"
+            draw_text(self.screen, f"Ply 0 / {len(plies)}  ·  {opening_s}",
+                      (ix, iy + 28), 16, TEXT_COLOR, bold=True)
+            draw_text(self.screen, f"Move time: —   ·   White time left: {w_left:.2f}s   ·   Black time left: {b_left:.2f}s",
+                      (ix, iy + 58), 14, DIM_TEXT)
+        else:
+            mnum = (ply_idx + 1) // 2
+            dots = "." if cur_ply_obj.get("mover_is_white") else "..."
+            mover_lbl = "Target" if (cur_ply_obj.get("mover_is_white") == g.get("target_is_white")) else "Opponent"
+            draw_text(
+                self.screen,
+                f"Move {mnum}{dots} {cur_ply_obj.get('san', '')}   ({mover_lbl})   ·   Ply {ply_idx} / {len(plies)}",
+                (ix, iy + 28), 17, TEXT_COLOR, bold=True,
+            )
+            draw_text(
+                self.screen,
+                f"Time spent on move: {mv_time:.3f}s",
+                (ix, iy + 58), 15, GOLD, bold=True,
+            )
+            draw_text(
+                self.screen,
+                f"White clock remaining: {w_left:.2f}s     ·     Black clock remaining: {b_left:.2f}s",
+                (ix, iy + 84), 14, TEXT_COLOR,
+            )
+            qual = cur_ply_obj.get("quality")
+            cpl = cur_ply_obj.get("cpl")
+            acc = cur_ply_obj.get("accuracy")
+            if qual is not None and cpl is not None:
+                draw_text(
+                    self.screen,
+                    f"Move quality: {qual}  (CPL {cpl:.1f}  ·  Accuracy {acc:.1f}%)",
+                    (ix, iy + 112), 14, ACCENT,
+                )
+
+        ev_lbl = _ef.format_eval_label(ev_cp, ev_mate) if _ef is not None else "0.0"
+        src_lbl = (
+            f"Stockfish Replay Analysis (depth {ev_depth})"
+            if (rew is not None and rew.engine_ready and ev_depth > 0)
+            else "Position Evaluation"
+        )
+        g_mq = g.get("move_quality")
+        mq_txt = (
+            f"   ·   Game Move-Quality Elo: {g_mq['move_quality_elo']:.0f} ({g_mq['accuracy_pct']:.1f}%)"
+            if g_mq else ""
+        )
+        draw_text(self.screen, f"{src_lbl}: {ev_lbl}{mq_txt}",
+                  (ix, iy + 144), 14, DIM_TEXT)
+        draw_text(self.screen, f"Result: {g.get('pgn_result', '')}  ({g.get('termination', '')})",
+                  (ix, iy + 170), 13, DIM_TEXT)
+
+        # Clickable Move Sheet
+        ml_rect = pygame.Rect(556, 306, 660, 444)
+        draw_rounded_panel(self.screen, ml_rect)
+        draw_text(self.screen, "MOVE LIST  (CLICK ANY MOVE OR PRESS ← / → / A / D)",
+                  (ml_rect.x + 18, ml_rect.y + 14), 13, ACCENT, bold=True)
+        pygame.draw.line(self.screen, BORDER,
+                         (ml_rect.x + 16, ml_rect.y + 38),
+                         (ml_rect.right - 16, ml_rect.y + 38), 1)
+        self._replay_move_hitboxes = []
+        full_rows = (len(plies) + 1) // 2
+        vis_m = 14
+        m_scroll = max(0, min(getattr(self, "replay_moves_scroll", 0), max(0, full_rows - vis_m)))
+        self.replay_moves_scroll = m_scroll
+        for r_i in range(vis_m):
+            full_idx = m_scroll + r_i
+            if full_idx >= full_rows:
+                break
+            ry = ml_rect.y + 46 + r_i * 27
+            draw_text(self.screen, f"{full_idx + 1}.", (ml_rect.x + 18, ry + 4), 13, DIM_TEXT)
+            for side_off, col_x in ((0, ml_rect.x + 64), (1, ml_rect.x + 356)):
+                p_num = full_idx * 2 + side_off + 1
+                if p_num > len(plies):
+                    continue
+                p_obj = plies[p_num - 1]
+                cell = pygame.Rect(col_x, ry, 276, 24)
+                sel = (p_num == ply_idx)
+                hov = cell.collidepoint(self.mouse_pos)
+                if sel or hov:
+                    pygame.draw.rect(
+                        self.screen, LIST_ROW_SEL if sel else PANEL_HOVER,
+                        cell, border_radius=5,
+                    )
+                draw_text(
+                    self.screen,
+                    f"{p_obj.get('san', ''):<8}  ({p_obj.get('move_time', 0.0):.2f}s)",
+                    (cell.x + 8, cell.y + 3), 13,
+                    ACCENT if sel else TEXT_COLOR, bold=sel,
+                )
+                self._replay_move_hitboxes.append((p_num, cell))
+
     def draw_done(self):
         if self.error_text:
             self._draw_error_report()
             return
-        if self.estimated_elo is None:
+        elapsed = time.time() - self.done_start_time if self.done_start_time else 999.0
+        if self.estimated_elo is not None and elapsed < REVEAL_DURATION:
+            self._draw_mystery_reveal(elapsed)
+            return
+        if getattr(self, "replay_game", None) is not None and hasattr(self, "_draw_replay_view"):
+            self._draw_replay_view()
+            return
+
+        if self.estimated_elo is None and not getattr(self, "playlist_results", None):
             draw_text_centered(self.screen, "Test Complete",
                                (WINDOW_WIDTH // 2, 40), 30, ACCENT, bold=True)
             draw_text_centered(self.screen, "Could not estimate Elo",
                                (WINDOW_WIDTH // 2, 100), 26, ERROR_COLOR)
-            draw_text_centered(self.screen, "Click anywhere to run another test.",
-                               (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 40), 16, DIM_TEXT)
+            if hasattr(self, "_draw_settings_button"):
+                self._draw_settings_button(self.done_back_rect, "← Back to Menu", primary=False)
             return
-        elapsed = time.time() - self.done_start_time if self.done_start_time else 999.0
-        if elapsed < REVEAL_DURATION:
-            self._draw_mystery_reveal(elapsed)
-            return
-        if not self.confetti_spawned:
+
+        if not self.confetti_spawned and self.estimated_elo is not None:
             self._spawn_confetti()
             self.confetti_spawned = True
             if self.celebration_sound:
@@ -3959,96 +5985,281 @@ class EloifyApp:
                     self.celebration_sound.play()
                 except Exception:
                     pass
-        pop_elapsed = elapsed - REVEAL_DURATION
-        draw_text_centered(self.screen, "Test Complete",
-                           (WINDOW_WIDTH // 2, 30), 26, ACCENT, bold=True)
-        self._draw_elo_pop(170, pop_elapsed)
-        w = self.worker
-        if w is not None:
-            score = (w.wins + 0.5 * w.draws) / w.games_played if w.games_played else 0.0
-            draw_text_centered(self.screen, f"Target: {w.target_name}",
-                               (WINDOW_WIDTH // 2, 268), 18, TEXT_COLOR)
-            draw_text_centered(
-                self.screen,
-                f"Games {w.games_played}    W {w.wins}  D {w.draws}  L {w.losses}    Score {score:.1%}",
-                (WINDOW_WIDTH // 2, 292), 16, DIM_TEXT)
-            cfg_line = f"Config: {w.target_config_str}"
-            if getattr(w, "high_elo_extended", False):
-                cfg_line += "    ·    3600+ Extended"
-            draw_text_centered(self.screen, cfg_line,
-                               (WINDOW_WIDTH // 2, 314), 14, DIM_TEXT)
 
-            draw_section(self.screen, "PER-OPPONENT RESULTS", (50, 348), width=900)
-            row_y = 378
-            col_x = [50, 460, 560, 640, 720, 800]
-            headers = ["Opponent", "Rating", "W", "D", "L", "Score"]
-            hdr_colors = [ACCENT, ACCENT, WIN_COLOR, DRAW_COLOR, LOSS_COLOR, ACCENT]
-            for cx, h, c in zip(col_x, headers, hdr_colors):
-                draw_text(self.screen, h, (cx, row_y), 15, c, bold=True)
-            row_y += 22
+        # Fallback path for bare AST-extracted HarnessApp in legacy tests
+        if not hasattr(self, "_active_done_entry"):
+            pop_elapsed = elapsed - REVEAL_DURATION
+            draw_text_centered(self.screen, "Test Complete",
+                               (WINDOW_WIDTH // 2, 30), 26, ACCENT, bold=True)
+            self._draw_elo_pop(170, pop_elapsed)
+            self._update_and_draw_confetti()
+            return
 
-            rows = [
-                (orig_idx, name, rating, ww, dd, ll)
-                for orig_idx, (name, rating, ww, dd, ll) in enumerate(w.per_opponent_results)
-                if ww + dd + ll > 0
-            ]
-            ext_start = getattr(w, "extension_start_index", None)
-            visible = RESULTS_VISIBLE_ROWS
-            max_scroll = max(0, len(rows) - visible)
-            self.results_scroll = max(0, min(getattr(self, "results_scroll", 0), max_scroll))
-            list_top_y = row_y
+        entry = self._active_done_entry()
+        playlist_results = getattr(self, "playlist_results", ()) or ([entry] if entry else [])
+        _ef = globals().get("ef")
+        pal = self._current_palette()
 
-            for view_idx, (orig_idx, name, rating, ww, dd, ll) in enumerate(
-                rows[self.results_scroll:self.results_scroll + visible]
-            ):
-                total = ww + dd + ll
-                pct = (ww + 0.5 * dd) / total * 100.0
-                frac = (ww + 0.5 * dd) / total
-                if (self.results_scroll + view_idx) % 2 == 0:
-                    pygame.draw.rect(self.screen, PANEL,
-                                     pygame.Rect(40, row_y - 2,
-                                                 WINDOW_WIDTH - 96, 20),
-                                     border_radius=3)
-                disp = name if len(name) <= 48 else name[:45] + "…"
-                is_ext_row = ext_start is not None and orig_idx >= ext_start
-                rating_color = GOLD if is_ext_row else TEXT_COLOR
-                draw_text(self.screen, disp, (col_x[0], row_y), 14, TEXT_COLOR)
-                draw_text(self.screen, f"{rating}", (col_x[1], row_y), 14,
-                          rating_color, bold=is_ext_row)
-                draw_text(self.screen, f"{ww}", (col_x[2], row_y), 14, WIN_COLOR)
-                draw_text(self.screen, f"{dd}", (col_x[3], row_y), 14, DRAW_COLOR)
-                draw_text(self.screen, f"{ll}", (col_x[4], row_y), 14, LOSS_COLOR)
-                if frac > 0.55:
-                    sc = WIN_COLOR
-                elif frac < 0.45:
-                    sc = LOSS_COLOR
-                else:
-                    sc = DRAW_COLOR
-                draw_text(self.screen, f"{pct:5.1f}%", (col_x[5], row_y), 14, sc, bold=True)
-                row_y += 22
+        # Sticky top header bar
+        pygame.draw.rect(self.screen, PANEL, pygame.Rect(0, 0, WINDOW_WIDTH, 58))
+        pygame.draw.line(self.screen, BORDER, (0, 58), (WINDOW_WIDTH, 58), 1)
+        self._draw_settings_button(self.done_back_rect, "← Back to Menu", primary=False)
+        hdr_title = (
+            f"Playlist Complete — {len(playlist_results)} Engines Tested"
+            if len(playlist_results) > 1 else "Elo Calculation Complete"
+        )
+        draw_text_centered(self.screen, hdr_title, (WINDOW_WIDTH // 2, 29), 22, ACCENT, bold=True)
+        self._draw_audio_controls(self.running_mute_rect, self.running_vol_rect)
 
-            if max_scroll > 0:
-                bar_x = WINDOW_WIDTH - 48
-                bar_y = list_top_y
-                bar_h = visible * 22 - 4
-                thumb_h = max(24, int(bar_h * visible / len(rows)))
-                thumb_y = bar_y + int((bar_h - thumb_h) * self.results_scroll / max_scroll)
-                pygame.draw.rect(self.screen, (60, 66, 80),
-                                 pygame.Rect(bar_x, bar_y, 4, bar_h), border_radius=2)
-                pygame.draw.rect(self.screen, ACCENT,
-                                 pygame.Rect(bar_x, thumb_y, 4, thumb_h), border_radius=2)
-
-            footer_hint = (
-                "Scroll for all opponents  ·  Click anywhere to run another test."
-                if max_scroll > 0 else "Click anywhere to run another test."
+        # Scrollable viewport below header
+        vp = pygame.Rect(0, 59, WINDOW_WIDTH, WINDOW_HEIGHT - 59)
+        rows = [
+            (orig_idx, name, rating, ww, dd, ll)
+            for orig_idx, (name, rating, ww, dd, ll) in enumerate(
+                entry.get("per_opponent_results", ()) if entry else ()
             )
-        else:
-            footer_hint = "Click anywhere to run another test."
-        draw_text_centered(self.screen, footer_hint,
-                           (WINDOW_WIDTH // 2, WINDOW_HEIGHT - 25), 16, DIM_TEXT)
+            if ww + dd + ll > 0
+        ]
+        games = entry.get("game_records", ()) if entry else ()
+
+        # Compute virtual document height
+        playlist_card_h = (74 + len(playlist_results) * 36) if len(playlist_results) > 1 else 0
+        hero_h = 260
+        opp_h = 84 + max(1, len(rows)) * 34
+        games_h = 88 + max(1, len(games)) * 38
+        content_h = 24 + playlist_card_h + hero_h + opp_h + games_h + 60
+        self.done_max_scroll = max(0, content_h - vp.h)
+        scroll_y = max(0, min(int(getattr(self, "done_scroll_y", 0)), self.done_max_scroll))
+        self.done_scroll_y = scroll_y
+
+        # Keep results_scroll clamped for backward test compatibility
+        vis_legacy = globals().get("RESULTS_VISIBLE_ROWS", 13)
+        self.results_scroll = max(0, min(getattr(self, "results_scroll", 0), max(0, len(rows) - vis_legacy)))
+
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(vp)
+        cy_doc = vp.y + 18 - scroll_y
+
+        # 1. Playlist All-Engines Leaderboard (when >1 engine tested)
+        self._done_playlist_hitboxes = []
+        if len(playlist_results) > 1:
+            pl_card = pygame.Rect(40, cy_doc, WINDOW_WIDTH - 96, playlist_card_h - 14)
+            draw_rounded_panel(self.screen, pl_card)
+            draw_text(self.screen, "ALL TESTED ENGINES  (CLICK AN ENGINE TO VIEW DETAILS & GAMES)",
+                      (pl_card.x + 20, pl_card.y + 14), 13, ACCENT, bold=True)
+            ry = pl_card.y + 44
+            for r_idx, res in enumerate(playlist_results):
+                rrect = pygame.Rect(pl_card.x + 14, ry, pl_card.w - 28, 32)
+                is_sel = (r_idx == getattr(self, "selected_result_idx", 0))
+                hov = rrect.collidepoint(self.mouse_pos) and vp.collidepoint(self.mouse_pos)
+                pygame.draw.rect(
+                    self.screen,
+                    LIST_ROW_SEL if is_sel else (PANEL_HOVER if hov else FIELD_BG),
+                    rrect, border_radius=6,
+                )
+                pygame.draw.rect(self.screen, ACCENT if is_sel else BORDER, rrect, width=1, border_radius=6)
+                e_elo = f"{res['estimated_elo']:.0f}" if res.get("estimated_elo") is not None else "ERR"
+                mq_s = (
+                    f"Move Elo {res['move_quality']['move_quality_elo']:.0f} ({res['move_quality']['accuracy_pct']:.1f}%)"
+                    if res.get("move_quality") else "Move Elo —"
+                )
+                draw_text(self.screen, f"#{r_idx + 1}  {res.get('engine_name', 'Engine')}",
+                          (rrect.x + 12, rrect.y + 7), 14, TEXT_COLOR, bold=is_sel)
+                draw_text(self.screen, f"Match Elo: {e_elo}",
+                          (rrect.x + 360, rrect.y + 7), 14, GOLD, bold=True)
+                draw_text(self.screen, mq_s,
+                          (rrect.x + 540, rrect.y + 7), 13, ACCENT)
+                draw_text(
+                    self.screen,
+                    f"{res.get('wins', 0)}W - {res.get('draws', 0)}D - {res.get('losses', 0)}L",
+                    (rrect.right - 160, rrect.y + 7), 13, DIM_TEXT,
+                )
+                self._done_playlist_hitboxes.append((r_idx, rrect))
+                ry += 35
+            cy_doc += playlist_card_h
+
+        # 2. Hero Elo & Move-Quality Card
+        hero_rect = pygame.Rect(40, cy_doc, WINDOW_WIDTH - 96, hero_h - 16)
+        draw_rounded_panel(self.screen, hero_rect)
+        pop_elapsed = max(0.0, elapsed - REVEAL_DURATION)
+        if self.estimated_elo is not None:
+            self._draw_elo_pop(hero_rect.y + 104, pop_elapsed, cx=hero_rect.x + 220)
+            if _ef is not None:
+                _ef.draw_elo_scale_bar(
+                    self.screen,
+                    pygame.Rect(hero_rect.x + 48, hero_rect.bottom - 42, 344, 16),
+                    self.estimated_elo,
+                    pal,
+                    show_endpoints=True,
+                    font_getter=lambda sz, bold=False: _get_font(_FONT_FAMILY, sz, bold=bold),
+                )
+
+        if entry:
+            rx = hero_rect.x + 450
+            ry = hero_rect.y + 22
+            draw_text(self.screen, f"Engine: {entry.get('engine_name', 'Target')}",
+                      (rx, ry), 20, TEXT_COLOR, bold=True)
+            gp = entry.get("games_played", 0)
+            ww, dd, ll = entry.get("wins", 0), entry.get("draws", 0), entry.get("losses", 0)
+            sc = (ww + 0.5 * dd) / gp if gp else 0.0
+            draw_text(
+                self.screen,
+                f"Games: {gp}    ·    W {ww}   D {dd}   L {ll}    ·    Score {sc:.1%}",
+                (rx, ry + 32), 15, DIM_TEXT,
+            )
+            cfg_line = f"Config: {entry.get('target_config_str', '')}"
+            if entry.get("high_elo_extended"):
+                cfg_line += "   ·   3600+ Extended"
+            draw_text(self.screen, cfg_line, (rx, ry + 56), 13, DIM_TEXT)
+
+            mq = entry.get("move_quality")
+            if mq:
+                mq_box = pygame.Rect(rx, ry + 86, 320, 74)
+                pygame.draw.rect(self.screen, FIELD_BG, mq_box, border_radius=10)
+                pygame.draw.rect(self.screen, ACCENT, mq_box, width=1, border_radius=10)
+                draw_text(self.screen, "MOVE-QUALITY ELO (PER-GAME AVG)",
+                          (mq_box.x + 14, mq_box.y + 10), 11, ACCENT, bold=True)
+                draw_text(self.screen, f"{mq['move_quality_elo']:.0f} Elo",
+                          (mq_box.x + 14, mq_box.y + 28), 24, GOLD, bold=True)
+                draw_text(self.screen, f"{mq['accuracy_pct']:.1f}% acc  ·  {mq['acpl']:.1f} ACPL",
+                          (mq_box.x + 150, mq_box.y + 36), 13, TEXT_COLOR)
+
+            rs = entry.get("resource_summary")
+            if rs and rs.get("samples", 0) > 0:
+                rs_box = pygame.Rect(rx + 336, ry + 86, 330, 74)
+                pygame.draw.rect(self.screen, FIELD_BG, rs_box, border_radius=10)
+                pygame.draw.rect(self.screen, BORDER, rs_box, width=1, border_radius=10)
+                draw_text(self.screen, "ENGINE DATA TRACKING",
+                          (rs_box.x + 14, rs_box.y + 10), 11, ACCENT, bold=True)
+                draw_text(
+                    self.screen,
+                    f"CPU Avg {rs['avg_cpu_pct']:.1f}%  (Peak {rs['peak_cpu_pct']:.0f}%)",
+                    (rs_box.x + 14, rs_box.y + 30), 13, TEXT_COLOR,
+                )
+                draw_text(
+                    self.screen,
+                    f"RAM Avg {rs['avg_ram_mb']:.1f} MB  (Peak {rs['peak_ram_mb']:.1f} MB)",
+                    (rs_box.x + 14, rs_box.y + 50), 13, DIM_TEXT,
+                )
+        cy_doc += hero_h
+
+        # 3. Per-Opponent Breakdown Card (with 300–4010 Elo scale bar + arrow!)
+        opp_card = pygame.Rect(40, cy_doc, WINDOW_WIDTH - 96, opp_h - 16)
+        draw_rounded_panel(self.screen, opp_card)
+        draw_text(self.screen, "PER-OPPONENT RESULTS",
+                  (opp_card.x + 20, opp_card.y + 14), 14, ACCENT, bold=True)
+        col_x = [opp_card.x + 20, opp_card.x + 390, opp_card.x + 480,
+                 opp_card.x + 710, opp_card.x + 780, opp_card.x + 850, opp_card.x + 940]
+        for cx_h, h_txt, h_col in zip(
+            col_x,
+            ["Opponent", "Rating", "Scale (300–4010)", "W", "D", "L", "Score"],
+            [ACCENT, ACCENT, ACCENT, WIN_COLOR, DRAW_COLOR, LOSS_COLOR, ACCENT],
+        ):
+            draw_text(self.screen, h_txt, (cx_h, opp_card.y + 42), 13, h_col, bold=True)
+
+        ext_start = entry.get("extension_start_index") if entry else None
+        ry = opp_card.y + 68
+        for r_i, (orig_idx, name, rating, ww, dd, ll) in enumerate(rows):
+            if r_i % 2 == 0:
+                pygame.draw.rect(
+                    self.screen, FIELD_BG,
+                    pygame.Rect(opp_card.x + 12, ry - 3, opp_card.w - 24, 30),
+                    border_radius=5,
+                )
+            tot = max(1, ww + dd + ll)
+            pct = (ww + 0.5 * dd) / tot * 100.0
+            frac = (ww + 0.5 * dd) / tot
+            is_ext = ext_start is not None and orig_idx >= ext_start
+            draw_text(self.screen, name[:40], (col_x[0], ry + 3), 14, TEXT_COLOR)
+            draw_text(self.screen, f"{rating}", (col_x[1], ry + 3), 14,
+                      GOLD if is_ext else TEXT_COLOR, bold=is_ext)
+            if _ef is not None:
+                _ef.draw_elo_scale_bar(
+                    self.screen,
+                    pygame.Rect(col_x[2], ry + 6, 190, 14),
+                    rating, pal, show_endpoints=False,
+                )
+            draw_text(self.screen, str(ww), (col_x[3], ry + 3), 14, WIN_COLOR)
+            draw_text(self.screen, str(dd), (col_x[4], ry + 3), 14, DRAW_COLOR)
+            draw_text(self.screen, str(ll), (col_x[5], ry + 3), 14, LOSS_COLOR)
+            sc_col = WIN_COLOR if frac > 0.55 else (LOSS_COLOR if frac < 0.45 else DRAW_COLOR)
+            draw_text(self.screen, f"{pct:5.1f}%", (col_x[6], ry + 3), 14, sc_col, bold=True)
+            ry += 34
+        cy_doc += opp_h
+
+        # 4. Individual Games Replay List
+        self._done_game_hitboxes = []
+        gm_card = pygame.Rect(40, cy_doc, WINDOW_WIDTH - 96, games_h - 16)
+        draw_rounded_panel(self.screen, gm_card)
+        draw_text(
+            self.screen,
+            "PLAYED GAMES  —  CLICK ANY GAME TO NAVIGATE MOVES (← / → OR A / D) WITH STRONG STOCKFISH EVAL",
+            (gm_card.x + 20, gm_card.y + 14), 13, ACCENT, bold=True,
+        )
+        pygame.draw.line(self.screen, BORDER,
+                         (gm_card.x + 16, gm_card.y + 40),
+                         (gm_card.right - 16, gm_card.y + 40), 1)
+        gy = gm_card.y + 50
+        if not games:
+            draw_text(self.screen, "No recorded move histories available.",
+                      (gm_card.x + 20, gy + 6), 14, DIM_TEXT)
+        for g_rec in games:
+            grect = pygame.Rect(gm_card.x + 14, gy, gm_card.w - 28, 34)
+            hov = grect.collidepoint(self.mouse_pos) and vp.collidepoint(self.mouse_pos)
+            pygame.draw.rect(
+                self.screen, PANEL_HOVER if hov else FIELD_BG, grect, border_radius=6
+            )
+            pygame.draw.rect(
+                self.screen, ACCENT if hov else BORDER, grect, width=1, border_radius=6
+            )
+            res_c = g_rec.get("result", "D")
+            rcol = WIN_COLOR if res_c == "W" else (LOSS_COLOR if res_c == "L" else DRAW_COLOR)
+            col_tag = "White" if g_rec.get("target_is_white") else "Black"
+            n_plies = len(g_rec.get("plies", ()))
+            g_mq = g_rec.get("move_quality")
+            mq_str = (
+                f"Move Elo {g_mq['move_quality_elo']:.0f} ({g_mq['accuracy_pct']:.1f}%)"
+                if g_mq else "Move Elo —"
+            )
+            draw_text(
+                self.screen,
+                f"Game #{g_rec.get('game_number', 1):<3}  ({col_tag})  vs  {g_rec.get('opponent_name', 'Opponent')[:28]} ({g_rec.get('opponent_rating', 0)})",
+                (grect.x + 12, grect.y + 8), 13, TEXT_COLOR, bold=hov,
+            )
+            draw_text(
+                self.screen,
+                f"{res_c}  {g_rec.get('pgn_result', '')}  ({n_plies} plies)",
+                (grect.x + 520, grect.y + 8), 13, rcol, bold=True,
+            )
+            draw_text(self.screen, mq_str, (grect.x + 710, grect.y + 8), 13, GOLD)
+            draw_text(self.screen, "Replay Moves →",
+                      (grect.right - 138, grect.y + 8), 13, ACCENT, bold=True)
+            self._done_game_hitboxes.append((g_rec, grect))
+            gy += 38
+
+        self.screen.set_clip(old_clip)
+
+        # Page scrollbar
+        if self.done_max_scroll > 0:
+            sb_x = WINDOW_WIDTH - 16
+            sb_y = vp.y + 8
+            sb_h = vp.h - 16
+            th_h = max(32, int(sb_h * vp.h / max(1, content_h)))
+            th_y = sb_y + int((sb_h - th_h) * scroll_y / self.done_max_scroll)
+            pygame.draw.rect(self.screen, BORDER, pygame.Rect(sb_x, sb_y, 6, sb_h), border_radius=3)
+            pygame.draw.rect(self.screen, ACCENT, pygame.Rect(sb_x, th_y, 6, th_h), border_radius=3)
+
         self._update_and_draw_confetti()
 
     def reset(self):
+        if self.worker and self.worker.is_alive():
+            if hasattr(self.worker, "stop"):
+                self.worker.stop()
+            else:
+                self.worker.running = False
+            self.worker.join(timeout=1.5)
+        if hasattr(self, "_stop_aux_workers"):
+            self._stop_aux_workers()
         try:
             pygame.mixer.stop()
         except Exception:
@@ -4058,8 +6269,12 @@ class EloifyApp:
         except Exception:
             pass
         self.state = "MENU"
-        self.target_path = None
-        self.status_text = "Select a UCI engine to begin."
+        if getattr(self, "engine_playlist", None):
+            self.target_path = self.engine_playlist[0]
+            self.status_text = f"Playlist ready ({len(self.engine_playlist)} queued)."
+        else:
+            self.target_path = None
+            self.status_text = "Select a UCI engine to begin."
         self.estimated_elo = None
         self.estimate_kind = None
         self.confidence = None
@@ -4068,6 +6283,11 @@ class EloifyApp:
         self.error_clipboard_status = ""
         self.error_scroll = 0
         self.results_scroll = 0
+        self.done_scroll_y = 0
+        self.done_max_scroll = 0
+        self.confirm_back_to_menu = False
+        self.replay_game = None
+        self.replay_flipped = None
         self._error_lines = None
         self.worker = None
         self.animation = None
@@ -4084,6 +6304,8 @@ class EloifyApp:
         self.last_draws        = 0
         self.last_losses       = 0
         self.dragging_slider   = None
+        self.dragging_rgb_slider = None
+        self.dragging_audio_volume = False
         self.settings_snapshot = None
         self.browse_show_hidden = False
         self.browse_hidden_count = 0
@@ -4096,6 +6318,8 @@ class EloifyApp:
             else:
                 self.worker.running = False
             self.worker.join(timeout=2)
+        if hasattr(self, "_stop_aux_workers"):
+            self._stop_aux_workers()
         try:
             pygame.key.set_repeat()
         except Exception:
