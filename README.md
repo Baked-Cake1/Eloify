@@ -70,7 +70,64 @@ Eloify loads chess sound effects from the `audio/` folder beside `main.py`:
 
 - `castle.mp3` — castling (`O-O` / `O-O-O`)
 - `game-start.mp3` — when a game starts
-- `game-end.mp3` — when a game finishes (win, draw, loss, checkmate, adjudication, etc.)
+- `game-end.mp3` — when a game finishes (win, draw, loss, checkmate, time forfeit, etc.)
 - `move-self.mp3` — piece moves and captures
 - `move-check.mp3` — moves that deliver check
 - `promote.mp3` — pawn promotions
+
+During live play and on the results screen, use the top-bar **Mute** button (or
+press **M**) and **Volume slider** to mute or adjust audio on the fly.
+
+## Live arena, chess rules & clocks
+
+- **30-second chess clocks**: Each side receives a **30.0s** chess clock per game
+  (ticking live next to the board). Running out of time forfeits the game on time.
+- **Standard draw rules without artificial move caps**: Games are never cut off
+  at 300 moves — they play to real checkmate, stalemate, insufficient material,
+  **threefold repetition**, **50-move rule** (50 full moves without a capture or
+  pawn move), or clock flag.
+- **Live Evaluation Bar**: A background Stockfish adjudicator worker (`Threads=1`,
+  `Hash=16 MB`) analyses the live board without interrupting or competing with
+  the playing engines.
+- **ETA & Opponent Progress Queue**: The right-side panel shows live **ETA**,
+  scrollable past and upcoming opponents with per-opponent `W-D-L` tallies, a
+  **300–4010 Elo** scale bar with pointer arrow under each opponent, and **Skip /
+  Unskip** toggles for upcoming opponents.
+- **Back to Menu confirmation**: Clicking **Back to Menu** prompts for
+  confirmation before stopping a running tournament or leaving results.
+
+## Engine playlist (multi-engine testing)
+
+On the main menu, use the **Engine Playlist** panel to queue multiple engines
+(`+ Add Engine`, `↑`/`↓` reorder, `✕` remove, `Clear`). Eloify tests every
+queued engine sequentially and displays a **Playlist Leaderboard** on the final
+results screen so you can click between engines and inspect each run.
+
+## Scrollable results & interactive game replay
+
+- **Calculating ELO progress bar**: After games finish, the reveal screen shows a
+  live progress bar while finalizing ratings.
+- **Full-page scrollable results**: Scroll through all opponent tiers, optional
+  Move-Quality Elo & Engine Data summaries, and the **Played Games** list.
+- **Interactive Game Replay Viewer**: Click **Replay →** on any game to step
+  through moves with **Left / Right** or **A / D** (`Home` / `End` jump to start
+  or end, `Esc` returns to results). While replaying, Stockfish runs with
+  **stronger multi-thread / larger-hash analysis** since no match is in progress,
+  and each move shows **time spent** and **remaining clock** for both engines.
+
+## Customization & optional analytics (Settings)
+
+Settings are organized into three tabs with a live board preview:
+
+1. **Engine & Rules**: Threads, Hash, Move Time, **Auto-Rotate Board** (always
+   view from the target engine's side), **Engine Data Tracking** (live & peak
+   CPU %, RAM MB, OS thread count, and UCI NPS), and **Per-Game Move-Quality Elo**
+   (ACPL, Accuracy %, and Move-Quality Elo per game and overall).
+2. **Board & Pieces**: Toggle **Board Coordinates (`a–h`, `1–8`)**, choose from
+   6 premade board skins (Classic Wood, Tournament Green, Ocean Ice, Slate,
+   Walnut, Royal Amethyst) or build a **Custom RGB Board Skin**, and pick from
+   5 piece styles (Classic 2-Tone, Vector Neo, Unicode Classic, Minimal Tokens,
+   Neon Glow).
+3. **Appearance**: Switch between **Dark Mode** and **Light Mode** and choose
+   from 6 accent themes (Emerald, Ocean Blue, Royal Purple, Crimson, Amber Gold,
+   Cyber Cyan).

@@ -215,32 +215,22 @@ class GameAndMoveSoundEventTests(unittest.TestCase):
         # Let's play: 1. O-O-O Kf7 2. a8=N Kg7 -> then set up stalemate on next move?
         # Even simpler: play a real legal sequence to stalemate!
         # FEN: "7k/5K2/8/6P1/8/8/8/8 w - - 0 1": 1. g6 (stalemate!)
-        script = iter(["e1c1", "e8f7", "a7a8n"])
+        script = iter(["e1c1", "e8f7", "a7a8n", "f7g7"])
 
-        def fake_play(board, role):
+        def fake_play_four(board, role):
             uci = next(script)
-            if uci == "a7a8n":
-                # After this promotion move, we'll inspect events; let's finish via max_moves=3
-                pass
+            if uci == "f7g7":
+                # Trigger standard 50-move rule on this non-pawn, non-capture king move
+                board.halfmove_clock = 99
             return SimpleNamespace(move=chess.Move.from_uci(uci))
 
         worker.board.reset = custom_reset
-        worker._safe_play = fake_play
-        worker._safe_analyse = lambda board: None
-
-        # Run 3 plies then trigger adjudication by setting current_move_number to 299 on 3rd move
-        def fake_play_three(board, role):
-            uci = next(script)
-            if uci == "a7a8n":
-                worker.current_move_number = 299
-            return SimpleNamespace(move=chess.Move.from_uci(uci))
-
-        worker._safe_play = fake_play_three
+        worker._safe_play = fake_play_four
         res = worker.play_game(target_is_white=True)
         self.assertEqual(res, "D")
         self.assertEqual(
             list(worker.sound_events),
-            ["game-start", "castle", "move-self", "promote", "game-end"],
+            ["game-start", "castle", "move-self", "promote", "move-self", "game-end"],
         )
 
     def test_stalemate_loss_and_adjudicated_outcomes_all_emit_game_end(self):
@@ -267,16 +257,18 @@ class GameAndMoveSoundEventTests(unittest.TestCase):
         opening = eloify.HIGH_ELO_OPENINGS[0]  # 10 book plies
         worker = eloify.TournamentWorker("target.exe", queue.Queue())
 
-        def play_one_then_stop(board, role):
-            worker.current_move_number = 299
+        def play_one_then_fifty_move_draw(board, role):
+            # Pick a quiet piece move so halfmove_clock increments from 99 -> 100 (50-move draw)
+            board.halfmove_clock = 99
+            for mv in board.legal_moves:
+                p = board.piece_at(mv.from_square)
+                if p and p.piece_type != chess.PAWN and not board.is_capture(mv):
+                    return SimpleNamespace(move=mv)
             return SimpleNamespace(move=next(iter(board.legal_moves)))
 
-        worker._safe_play = play_one_then_stop
-        worker._safe_analyse = lambda board: {
-            "score": chess.engine.PovScore(chess.engine.Cp(-350), chess.WHITE)
-        }
+        worker._safe_play = play_one_then_fifty_move_draw
         res = worker.play_game(target_is_white=True, opening=opening)
-        self.assertEqual(res, "L")
+        self.assertEqual(res, "D")
         events = list(worker.sound_events)
         self.assertEqual(events[0], "game-start")
         self.assertEqual(events[-1], "game-end")
