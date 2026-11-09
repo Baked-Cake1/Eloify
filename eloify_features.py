@@ -605,6 +605,72 @@ def aggregate_move_quality_elo(game_records):
     }
 
 
+MOVE_ELO_WEIGHT = 0.85
+WIN_RATE_ELO_WEIGHT = 0.15
+
+
+def compute_final_elo(win_rate_elo, move_elo=None, high_elo_extended=False):
+    """Combine Move Elo and Win Rate Elo into a single Final Estimated Elo.
+
+    Why Move Elo weighs more (85% Move Elo + 15% Win Rate Elo) in standard runs:
+      - Across a 2-games-per-opponent run at fixed bullet movetime + 30s sudden-death
+        clock, Move Elo evaluates ~800-2,000+ individual moves (40x-80x more data
+        points than binary/ternary game outcomes) and is resilient to sudden-death
+        clock flags in already-outplayed endgames.
+      - Retaining 15% Win Rate Elo anchors the rating to practical game conversion,
+        tactical survival, and clock discipline while correcting the slight optimism
+        of pure centipawn-loss ratings in quiet positions.
+      - In the 3600+ High-Elo Time-Odds Extension (`high_elo_extended=True` with
+        `win_rate_elo > move_elo`), centipawn loss saturates near zero around ~3600
+        while calibrated Stockfish 2x-32x time-odds Win Rate Elo resolves up to 4010+,
+        so the weights invert (85% Win Rate Elo + 15% Move Elo) in that superhuman tier.
+    """
+    if win_rate_elo is None and move_elo is None:
+        return None
+    if move_elo is None:
+        w = float(win_rate_elo)
+        return {
+            "final_elo":    round(w, 1),
+            "win_rate_elo": round(w, 1),
+            "move_elo":     None,
+            "move_weight":  0.0,
+            "win_weight":   1.0,
+            "formula":      "100% Win Rate Elo",
+        }
+    if win_rate_elo is None:
+        m = float(move_elo)
+        return {
+            "final_elo":    round(m, 1),
+            "win_rate_elo": None,
+            "move_elo":     round(m, 1),
+            "move_weight":  1.0,
+            "win_weight":   0.0,
+            "formula":      "100% Move Elo",
+        }
+
+    w = float(win_rate_elo)
+    m = float(move_elo)
+    if high_elo_extended and w > m:
+        move_w = WIN_RATE_ELO_WEIGHT
+        win_w = MOVE_ELO_WEIGHT
+        combined = (15.0 * m + 85.0 * w) / 100.0
+        formula = "85% Win Rate Elo + 15% Move Elo (3600+ Extended)"
+    else:
+        move_w = MOVE_ELO_WEIGHT
+        win_w = WIN_RATE_ELO_WEIGHT
+        combined = (85.0 * m + 15.0 * w) / 100.0
+        formula = "85% Move Elo + 15% Win Rate Elo"
+
+    return {
+        "final_elo":    round(combined + 1e-9, 1),
+        "win_rate_elo": round(w, 1),
+        "move_elo":     round(m, 1),
+        "move_weight":  move_w,
+        "win_weight":   win_w,
+        "formula":      formula,
+    }
+
+
 # ----------------------------------------------------------------------
 # SAFE ENGINE SHUTDOWN HELPER
 # ----------------------------------------------------------------------
