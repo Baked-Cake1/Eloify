@@ -629,6 +629,74 @@ class PlaylistReplayEvalAndTelemetryTests(unittest.TestCase):
         self.assertLess(blunder_mq["move_quality_elo"], 1500)
         self.assertLess(blunder_mq["accuracy_pct"], 40.0)
 
+    def test_final_combined_elo_weighting_and_done_summary_display(self):
+        # Foxchess v1.1: 2384 Win Rate Elo, 2946 Move Elo -> 2861.7 (~2862 vs 2870 claimed)
+        fox_11 = ef.compute_final_elo(win_rate_elo=2384, move_elo=2946)
+        self.assertEqual(fox_11["move_weight"], 0.85)
+        self.assertEqual(fox_11["win_weight"], 0.15)
+        self.assertAlmostEqual(fox_11["final_elo"], 2861.7, places=1)
+        self.assertEqual(round(fox_11["final_elo"]), 2862)
+
+        # Foxchess v1.2: 2803 Win Rate Elo, 3086 Move Elo -> 3043.6 (~3044 vs 3060 claimed)
+        fox_12 = ef.compute_final_elo(win_rate_elo=2803, move_elo=3086)
+        self.assertAlmostEqual(fox_12["final_elo"], 3043.6, places=1)
+        self.assertEqual(round(fox_12["final_elo"]), 3044)
+
+        # Superhuman 3600+ extended run prioritizes calibrated time-odds Win Rate Elo
+        sf_ext = ef.compute_final_elo(
+            win_rate_elo=3890, move_elo=3580, high_elo_extended=True
+        )
+        self.assertEqual(sf_ext["win_weight"], 0.85)
+        self.assertEqual(sf_ext["move_weight"], 0.15)
+        self.assertAlmostEqual(sf_ext["final_elo"], 3843.5, places=1)
+
+        # Fallback when Move Elo is disabled
+        wr_only = ef.compute_final_elo(win_rate_elo=2450, move_elo=None)
+        self.assertEqual(wr_only["final_elo"], 2450.0)
+
+        # Verify single-engine DONE screen also renders the Final Elo Result card
+        app = _make_headless_app()
+        try:
+            app.state = "DONE"
+            app.done_start_time = time.time() - 5.0
+            app.estimated_elo = 2384.0
+            app.estimate_kind = "ok"
+            app.confidence = 140.0
+            app.playlist_results = [{
+                "engine_name": "Foxchess v1.1",
+                "engine_path": "fox11.exe",
+                "target_config_str": "Threads=4, Hash=512 MB",
+                "estimate_kind": "ok",
+                "estimated_elo": 2384.0,
+                "win_rate_elo": 2384.0,
+                "move_elo": 2946.0,
+                "final_elo": fox_11["final_elo"],
+                "final_elo_info": fox_11,
+                "confidence": 140.0,
+                "wins": 18,
+                "draws": 4,
+                "losses": 18,
+                "games_played": 40,
+                "per_opponent_results": [("Opp", 2400, 1, 0, 1)],
+                "game_records": [],
+                "move_quality": {
+                    "move_quality_elo": 2946.0,
+                    "accuracy_pct": 93.4,
+                    "acpl": 18.2,
+                    "target_moves": 920,
+                },
+                "resource_summary": None,
+                "high_elo_extended": False,
+                "extension_start_index": None,
+                "error_text": None,
+                "error_report": "",
+            }]
+            app.selected_result_idx = 0
+            app.draw_done()
+            self.assertEqual(len(app._done_playlist_hitboxes), 1)
+        finally:
+            app._stop_aux_workers()
+
 
 if __name__ == "__main__":
     unittest.main()

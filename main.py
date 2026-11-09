@@ -1385,6 +1385,10 @@ def draw_text_centered(surface, text, center, size=24, color=TEXT_COLOR, bold=Fa
     surf = _render_text(text, size, color, bold)
     surface.blit(surf, surf.get_rect(center=center))
 
+def draw_text_right(surface, text, topright, size=24, color=TEXT_COLOR, bold=False):
+    surf = _render_text(text, size, color, bold)
+    surface.blit(surf, surf.get_rect(topright=topright))
+
 def draw_section(surface, title, pos, width=150):
     draw_text(surface, title, pos, 15, ACCENT, bold=True)
     y = pos[1] + 19
@@ -4431,12 +4435,26 @@ class EloifyApp:
         if estimate_payload is not None:
             est_kind, est_elo = estimate_payload[0]
             ci = estimate_payload[1]
+        mq = getattr(w, "move_quality_summary", None)
+        move_elo = mq["move_quality_elo"] if mq and "move_quality_elo" in mq else None
+        high_ext = getattr(w, "high_elo_extended", False)
+        _ef = globals().get("ef")
+        final_info = (
+            _ef.compute_final_elo(est_elo, move_elo, high_elo_extended=high_ext)
+            if _ef is not None and hasattr(_ef, "compute_final_elo")
+            else None
+        )
+        final_elo = final_info["final_elo"] if final_info is not None else est_elo
         entry = {
             "engine_name":          getattr(w, "target_name", os.path.basename(self.target_path or "Engine")),
             "engine_path":          getattr(w, "target_path", self.target_path),
             "target_config_str":    getattr(w, "target_config_str", ""),
             "estimate_kind":        est_kind,
             "estimated_elo":        est_elo,
+            "win_rate_elo":         est_elo,
+            "move_elo":             move_elo,
+            "final_elo":            final_elo,
+            "final_elo_info":       final_info,
             "confidence":           ci,
             "wins":                 getattr(w, "wins", 0),
             "draws":                getattr(w, "draws", 0),
@@ -4444,9 +4462,9 @@ class EloifyApp:
             "games_played":         getattr(w, "games_played", 0),
             "per_opponent_results": list(getattr(w, "per_opponent_results", ())),
             "game_records":         list(getattr(w, "game_records", ())),
-            "move_quality":         getattr(w, "move_quality_summary", None),
+            "move_quality":         mq,
             "resource_summary":     getattr(w, "resource_summary", None),
-            "high_elo_extended":    getattr(w, "high_elo_extended", False),
+            "high_elo_extended":    high_ext,
             "extension_start_index": getattr(w, "extension_start_index", None),
             "error_text":           error_payload["summary"] if error_payload else None,
             "error_report":         error_payload["report"] if error_payload else "",
@@ -4886,14 +4904,19 @@ class EloifyApp:
             pygame.draw.circle(halo, (255, 200, 50, a), (halo_size, halo_size), r)
         self.screen.blit(halo, (cx - halo_size, cy - halo_size))
 
-    def _draw_elo_pop(self, cy, pop_elapsed, cx=None, target_surf=None):
+    def _draw_elo_pop(self, cy, pop_elapsed, cx=None, target_surf=None,
+                      elo_value=None, title_text=None, subtitle_text=None):
         dest = target_surf if target_surf is not None else self.screen
-        elo_val = self.estimated_elo if self.estimated_elo is not None else 0.0
+        elo_val = (
+            elo_value if elo_value is not None
+            else (self.estimated_elo if self.estimated_elo is not None else 0.0)
+        )
         elo_str = f"{elo_val:.0f}"
-        if self.estimate_kind == "lower_bound":
-            elo_str = f"≥ {elo_str}"
-        elif self.estimate_kind == "upper_bound":
-            elo_str = f"≤ {elo_str}"
+        if elo_value is None:
+            if self.estimate_kind == "lower_bound":
+                elo_str = f"≥ {elo_str}"
+            elif self.estimate_kind == "upper_bound":
+                elo_str = f"≤ {elo_str}"
         if cx is None:
             cx = WINDOW_WIDTH // 2
         cache_key = (elo_str, self.estimate_kind, GOLD)
@@ -4934,11 +4957,16 @@ class EloifyApp:
                 pass
         label_alpha = min(255, int(255 * max(0.0, (pop_elapsed - 0.2) / 0.4)))
         if label_alpha > 0:
-            lf = _get_font(_FONT_FAMILY, 17, True)
-            label = lf.render("WIN-RATE ELO", True, DIM_TEXT)
+            lf = _get_font(_FONT_FAMILY, 16, True)
+            label = lf.render(title_text or "FINAL ESTIMATED ELO", True, ACCENT if title_text else DIM_TEXT)
             label.set_alpha(label_alpha)
-            dest.blit(label, label.get_rect(center=(cx, cy - 66)))
-            if self.confidence is not None and self.estimate_kind == "ok":
+            dest.blit(label, label.get_rect(center=(cx, cy - 64)))
+            if subtitle_text:
+                cf = _get_font(_FONT_FAMILY, 13, False)
+                ci = cf.render(subtitle_text, True, DIM_TEXT)
+                ci.set_alpha(label_alpha)
+                dest.blit(ci, ci.get_rect(center=(cx, cy + 54)))
+            elif self.confidence is not None and self.estimate_kind == "ok":
                 cf = _get_font(_FONT_FAMILY, 15, False)
                 ci = cf.render(f"± {self.confidence:.0f}  (95% CI)",
                                True, DIM_TEXT)
@@ -6023,11 +6051,13 @@ class EloifyApp:
         games = entry.get("game_records", ()) if entry else ()
 
         # Compute virtual document height
-        playlist_card_h = (74 + len(playlist_results) * 36) if len(playlist_results) > 1 else 0
-        hero_h = 260
+        rs_active = entry.get("resource_summary") if entry else None
+        has_rs = bool(rs_active and rs_active.get("samples", 0) > 0)
+        final_summary_card_h = (82 + max(1, len(playlist_results)) * 44) if playlist_results else 0
+        hero_h = 298 if has_rs else 258
         opp_h = 84 + max(1, len(rows)) * 34
         games_h = 88 + max(1, len(games)) * 38
-        content_h = 24 + playlist_card_h + hero_h + opp_h + games_h + 60
+        content_h = 24 + final_summary_card_h + hero_h + opp_h + games_h + 60
         self.done_max_scroll = max(0, content_h - vp.h)
         scroll_y = max(0, min(int(getattr(self, "done_scroll_y", 0)), self.done_max_scroll))
         self.done_scroll_y = scroll_y
@@ -6040,63 +6070,150 @@ class EloifyApp:
         self.screen.set_clip(vp)
         cy_doc = vp.y + 18 - scroll_y
 
-        # 1. Playlist All-Engines Leaderboard (when >1 engine tested)
+        def _resolve_final_info(res_dict):
+            if not res_dict:
+                return None
+            info = res_dict.get("final_elo_info")
+            if info is not None:
+                return info
+            w_elo = res_dict.get("win_rate_elo", res_dict.get("estimated_elo"))
+            mq_d = res_dict.get("move_quality")
+            m_elo = res_dict.get("move_elo")
+            if m_elo is None and mq_d:
+                m_elo = mq_d.get("move_quality_elo")
+            if _ef is not None and hasattr(_ef, "compute_final_elo"):
+                return _ef.compute_final_elo(
+                    w_elo, m_elo, high_elo_extended=bool(res_dict.get("high_elo_extended"))
+                )
+            return None
+
+        # 1. Dedicated FINAL ELO RESULT Summary Display (for every engine put in!)
         self._done_playlist_hitboxes = []
-        if len(playlist_results) > 1:
-            pl_card = pygame.Rect(40, cy_doc, WINDOW_WIDTH - 96, playlist_card_h - 14)
+        if playlist_results:
+            pl_card = pygame.Rect(40, cy_doc, WINDOW_WIDTH - 96, final_summary_card_h - 14)
             draw_rounded_panel(self.screen, pl_card)
-            draw_text(self.screen, "ALL TESTED ENGINES  (CLICK AN ENGINE TO VIEW DETAILS & GAMES)",
-                      (pl_card.x + 20, pl_card.y + 14), 13, ACCENT, bold=True)
-            ry = pl_card.y + 44
+            hdr_lbl = (
+                "FINAL ELO RESULTS  —  COMBINED RATING FOR EACH ENGINE  (CLICK TO INSPECT)"
+                if len(playlist_results) > 1
+                else "FINAL ELO RESULT  —  COMBINED RATING SUMMARY"
+            )
+            draw_text(self.screen, hdr_lbl,
+                      (pl_card.x + 20, pl_card.y + 13), 13, ACCENT, bold=True)
+            draw_text_right(
+                self.screen,
+                "Weighting: 85% Move Elo + 15% Win-Rate Elo",
+                (pl_card.right - 20, pl_card.y + 13),
+                12, DIM_TEXT,
+            )
+            ry = pl_card.y + 42
+            row_sel_col = globals().get("LIST_ROW_SEL", PANEL_HOVER)
+            field_bg_col = globals().get("FIELD_BG", PANEL)
             for r_idx, res in enumerate(playlist_results):
-                rrect = pygame.Rect(pl_card.x + 14, ry, pl_card.w - 28, 32)
+                rrect = pygame.Rect(pl_card.x + 14, ry, pl_card.w - 28, 38)
                 is_sel = (r_idx == getattr(self, "selected_result_idx", 0))
                 hov = rrect.collidepoint(self.mouse_pos) and vp.collidepoint(self.mouse_pos)
                 pygame.draw.rect(
                     self.screen,
-                    LIST_ROW_SEL if is_sel else (PANEL_HOVER if hov else FIELD_BG),
-                    rrect, border_radius=6,
+                    row_sel_col if is_sel else (PANEL_HOVER if hov else field_bg_col),
+                    rrect, border_radius=8,
                 )
-                pygame.draw.rect(self.screen, ACCENT if is_sel else BORDER, rrect, width=1, border_radius=6)
-                e_elo = f"{res['estimated_elo']:.0f}" if res.get("estimated_elo") is not None else "ERR"
-                mq_s = (
-                    f"Move Elo {res['move_quality']['move_quality_elo']:.0f} ({res['move_quality']['accuracy_pct']:.1f}%)"
-                    if res.get("move_quality") else "Move Elo —"
-                )
-                draw_text(self.screen, f"#{r_idx + 1}  {res.get('engine_name', 'Engine')}",
-                          (rrect.x + 12, rrect.y + 7), 14, TEXT_COLOR, bold=is_sel)
-                draw_text(self.screen, f"Match Elo: {e_elo}",
-                          (rrect.x + 360, rrect.y + 7), 14, GOLD, bold=True)
-                draw_text(self.screen, mq_s,
-                          (rrect.x + 540, rrect.y + 7), 13, ACCENT)
-                draw_text(
+                pygame.draw.rect(
                     self.screen,
-                    f"{res.get('wins', 0)}W - {res.get('draws', 0)}D - {res.get('losses', 0)}L",
-                    (rrect.right - 160, rrect.y + 7), 13, DIM_TEXT,
+                    GOLD if (len(playlist_results) == 1 or is_sel) else BORDER,
+                    rrect, width=1, border_radius=8,
+                )
+
+                f_info = _resolve_final_info(res)
+                final_val = f_info["final_elo"] if f_info else res.get("estimated_elo")
+                win_val = f_info["win_rate_elo"] if f_info else res.get("estimated_elo")
+                move_val = f_info["move_elo"] if f_info else None
+                mw_pct = int(round((f_info["move_weight"] if f_info else 0.85) * 100))
+                ww_pct = int(round((f_info["win_weight"] if f_info else 0.15) * 100))
+
+                ename = str(res.get("engine_name", "Engine"))
+                if len(ename) > 25:
+                    ename = ename[:23] + "…"
+                draw_text(self.screen, f"#{r_idx + 1}  {ename}",
+                          (rrect.x + 12, rrect.y + 9), 15, TEXT_COLOR, bold=True)
+
+                # Highlighted Final Elo pill
+                pill_r = pygame.Rect(rrect.x + 266, rrect.y + 5, 190, 28)
+                pygame.draw.rect(self.screen, PANEL, pill_r, border_radius=6)
+                pygame.draw.rect(self.screen, GOLD, pill_r, width=1, border_radius=6)
+                final_txt = f"Final Elo:  {final_val:.0f}" if final_val is not None else "Final Elo:  ERR"
+                draw_text_centered(self.screen, final_txt, pill_r.center, 15, GOLD, bold=True)
+
+                # Mini 300–4010 Elo scale bar
+                if _ef is not None and final_val is not None:
+                    _ef.draw_elo_scale_bar(
+                        self.screen,
+                        pygame.Rect(rrect.x + 470, rrect.y + 11, 134, 15),
+                        final_val,
+                        pal,
+                    )
+
+                mv_txt = (
+                    f"Move: {move_val:.0f} ({mw_pct}%)"
+                    if move_val is not None else "Move: —"
+                )
+                wr_txt = (
+                    f"Win-Rate: {win_val:.0f} ({ww_pct}%)"
+                    if win_val is not None else "Win-Rate: —"
+                )
+                draw_text(self.screen, mv_txt,
+                          (rrect.x + 620, rrect.y + 10), 13, ACCENT, bold=True)
+                draw_text(self.screen, wr_txt,
+                          (rrect.x + 800, rrect.y + 10), 13, TEXT_COLOR)
+                draw_text_right(
+                    self.screen,
+                    f"{res.get('wins', 0)}W-{res.get('draws', 0)}D-{res.get('losses', 0)}L",
+                    (rrect.right - 14, rrect.y + 10), 13, DIM_TEXT,
                 )
                 self._done_playlist_hitboxes.append((r_idx, rrect))
-                ry += 35
-            cy_doc += playlist_card_h
+                ry += 42
+            cy_doc += final_summary_card_h
 
-        # 2. Hero Elo & Move-Quality Card
+        # 2. Selected Engine Hero Breakdown Card (Final Elo + Move Elo + Win-Rate Elo)
         hero_rect = pygame.Rect(40, cy_doc, WINDOW_WIDTH - 96, hero_h - 16)
         draw_rounded_panel(self.screen, hero_rect)
         pop_elapsed = max(0.0, elapsed - REVEAL_DURATION)
-        if self.estimated_elo is not None:
-            self._draw_elo_pop(hero_rect.y + 104, pop_elapsed, cx=hero_rect.x + 220)
+        active_finfo = _resolve_final_info(entry)
+        hero_final_elo = (
+            active_finfo["final_elo"]
+            if active_finfo and active_finfo.get("final_elo") is not None
+            else self.estimated_elo
+        )
+        hero_sub = None
+        if active_finfo and active_finfo.get("move_elo") is not None and active_finfo.get("win_rate_elo") is not None:
+            mw_p = int(round(active_finfo["move_weight"] * 100))
+            ww_p = int(round(active_finfo["win_weight"] * 100))
+            hero_sub = (
+                f"{mw_p}% Move ({active_finfo['move_elo']:.0f})  +  "
+                f"{ww_p}% Win-Rate ({active_finfo['win_rate_elo']:.0f})"
+            )
+
+        if hero_final_elo is not None:
+            self._draw_elo_pop(
+                hero_rect.y + 104,
+                pop_elapsed,
+                cx=hero_rect.x + 220,
+                elo_value=hero_final_elo,
+                title_text="FINAL ESTIMATED ELO",
+                subtitle_text=hero_sub,
+            )
             if _ef is not None:
                 _ef.draw_elo_scale_bar(
                     self.screen,
-                    pygame.Rect(hero_rect.x + 48, hero_rect.bottom - 42, 344, 16),
-                    self.estimated_elo,
+                    pygame.Rect(hero_rect.x + 48, hero_rect.y + 198, 344, 16),
+                    hero_final_elo,
                     pal,
                     show_endpoints=True,
                     font_getter=lambda sz, bold=False: _get_font(_FONT_FAMILY, sz, bold=bold),
                 )
 
         if entry:
-            rx = hero_rect.x + 450
-            ry = hero_rect.y + 22
+            rx = hero_rect.x + 448
+            ry = hero_rect.y + 20
             draw_text(self.screen, f"Engine: {entry.get('engine_name', 'Target')}",
                       (rx, ry), 20, TEXT_COLOR, bold=True)
             gp = entry.get("games_played", 0)
@@ -6105,41 +6222,63 @@ class EloifyApp:
             draw_text(
                 self.screen,
                 f"Games: {gp}    ·    W {ww}   D {dd}   L {ll}    ·    Score {sc:.1%}",
-                (rx, ry + 32), 15, DIM_TEXT,
+                (rx, ry + 30), 15, DIM_TEXT,
             )
             cfg_line = f"Config: {entry.get('target_config_str', '')}"
             if entry.get("high_elo_extended"):
                 cfg_line += "   ·   3600+ Extended"
-            draw_text(self.screen, cfg_line, (rx, ry + 56), 13, DIM_TEXT)
+            draw_text(self.screen, cfg_line, (rx, ry + 54), 13, DIM_TEXT)
 
+            field_bg_col = globals().get("FIELD_BG", PANEL)
             mq = entry.get("move_quality")
-            if mq:
-                mq_box = pygame.Rect(rx, ry + 86, 320, 74)
-                pygame.draw.rect(self.screen, FIELD_BG, mq_box, border_radius=10)
-                pygame.draw.rect(self.screen, ACCENT, mq_box, width=1, border_radius=10)
-                draw_text(self.screen, "MOVE-QUALITY ELO (PER-GAME AVG)",
-                          (mq_box.x + 14, mq_box.y + 10), 11, ACCENT, bold=True)
-                draw_text(self.screen, f"{mq['move_quality_elo']:.0f} Elo",
-                          (mq_box.x + 14, mq_box.y + 28), 24, GOLD, bold=True)
-                draw_text(self.screen, f"{mq['accuracy_pct']:.1f}% acc  ·  {mq['acpl']:.1f} ACPL",
-                          (mq_box.x + 150, mq_box.y + 36), 13, TEXT_COLOR)
+            mw_lbl = int(round((active_finfo["move_weight"] if active_finfo else 0.85) * 100))
+            ww_lbl = int(round((active_finfo["win_weight"] if active_finfo else 0.15) * 100))
 
-            rs = entry.get("resource_summary")
-            if rs and rs.get("samples", 0) > 0:
-                rs_box = pygame.Rect(rx + 336, ry + 86, 330, 74)
-                pygame.draw.rect(self.screen, FIELD_BG, rs_box, border_radius=10)
-                pygame.draw.rect(self.screen, BORDER, rs_box, width=1, border_radius=10)
-                draw_text(self.screen, "ENGINE DATA TRACKING",
-                          (rs_box.x + 14, rs_box.y + 10), 11, ACCENT, bold=True)
+            # Box A: Move Elo
+            mq_box = pygame.Rect(rx, ry + 82, 326, 76)
+            pygame.draw.rect(self.screen, field_bg_col, mq_box, border_radius=10)
+            pygame.draw.rect(self.screen, ACCENT, mq_box, width=1, border_radius=10)
+            draw_text(self.screen, f"MOVE ELO  ({mw_lbl}% WEIGHT)",
+                      (mq_box.x + 14, mq_box.y + 10), 11, ACCENT, bold=True)
+            if mq:
+                draw_text(self.screen, f"{mq['move_quality_elo']:.0f} Elo",
+                          (mq_box.x + 14, mq_box.y + 29), 24, GOLD, bold=True)
+                draw_text(self.screen, f"{mq['accuracy_pct']:.1f}% acc · {mq['acpl']:.1f} ACPL",
+                          (mq_box.x + 148, mq_box.y + 36), 12, TEXT_COLOR)
+            else:
+                draw_text(self.screen, "Disabled", (mq_box.x + 14, mq_box.y + 32), 18, DIM_TEXT)
+
+            # Box B: Win-Rate Elo
+            wr_box = pygame.Rect(rx + 340, ry + 82, 326, 76)
+            pygame.draw.rect(self.screen, field_bg_col, wr_box, border_radius=10)
+            pygame.draw.rect(self.screen, BORDER, wr_box, width=1, border_radius=10)
+            draw_text(self.screen, f"WIN-RATE ELO  ({ww_lbl}% WEIGHT)",
+                      (wr_box.x + 14, wr_box.y + 10), 11, TEXT_COLOR, bold=True)
+            wr_val = entry.get("win_rate_elo", entry.get("estimated_elo"))
+            wr_ci = entry.get("confidence")
+            wr_kind = entry.get("estimate_kind")
+            if wr_val is not None:
+                prefix = "≥ " if wr_kind == "lower_bound" else ("≤ " if wr_kind == "upper_bound" else "")
+                draw_text(self.screen, f"{prefix}{wr_val:.0f} Elo",
+                          (wr_box.x + 14, wr_box.y + 29), 24, TEXT_COLOR, bold=True)
+                if wr_ci is not None and wr_kind == "ok":
+                    draw_text(self.screen, f"± {wr_ci:.0f} (95% CI)",
+                              (wr_box.x + 162, wr_box.y + 36), 12, DIM_TEXT)
+            else:
+                draw_text(self.screen, "—", (wr_box.x + 14, wr_box.y + 32), 18, DIM_TEXT)
+
+            # Optional Engine Data Tracking strip below the two Elo boxes
+            if has_rs:
+                rs = rs_active
+                rs_box = pygame.Rect(rx, ry + 168, 666, 34)
+                pygame.draw.rect(self.screen, field_bg_col, rs_box, border_radius=8)
+                pygame.draw.rect(self.screen, BORDER, rs_box, width=1, border_radius=8)
+                nps_k = f"{rs.get('live_nps', 0) / 1000.0:.0f}k NPS" if rs.get("live_nps") else "NPS —"
                 draw_text(
                     self.screen,
-                    f"CPU Avg {rs['avg_cpu_pct']:.1f}%  (Peak {rs['peak_cpu_pct']:.0f}%)",
-                    (rs_box.x + 14, rs_box.y + 30), 13, TEXT_COLOR,
-                )
-                draw_text(
-                    self.screen,
-                    f"RAM Avg {rs['avg_ram_mb']:.1f} MB  (Peak {rs['peak_ram_mb']:.1f} MB)",
-                    (rs_box.x + 14, rs_box.y + 50), 13, DIM_TEXT,
+                    f"ENGINE DATA:   CPU Avg {rs['avg_cpu_pct']:.1f}% (Peak {rs['peak_cpu_pct']:.0f}%)   ·   "
+                    f"RAM Avg {rs['avg_ram_mb']:.1f} MB (Peak {rs['peak_ram_mb']:.1f} MB)   ·   {nps_k}",
+                    (rs_box.x + 14, rs_box.y + 9), 12, DIM_TEXT,
                 )
         cy_doc += hero_h
 

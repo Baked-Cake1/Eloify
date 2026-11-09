@@ -107,6 +107,11 @@ results screen so you can click between engines and inspect each run.
 
 - **Calculating ELO progress bar**: After games finish, the reveal screen shows a
   live progress bar while finalizing ratings.
+- **Final Elo Result display (for every tested engine)**: Combines **Move Elo
+  (85%)** and **Win-Rate Elo (15%)** into a single **Final Estimated Elo** for
+  each engine tested (in the 3600+ High-Elo Time-Odds Extension where centipawn
+  loss saturates near zero, weights invert to **85% Win-Rate Elo + 15% Move Elo**),
+  while still displaying both underlying ratings side by side.
 - **Full-page scrollable results**: Scroll through all opponent tiers, optional
   Move-Quality Elo & Engine Data summaries, and the **Played Games** list.
 - **Interactive Game Replay Viewer**: Click **Replay →** on any game to step
